@@ -1,0 +1,703 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import time
+from numpy import sqrt, pi, exp
+from numpy.linalg import norm
+from scipy.special import erf
+from scipy.stats import qmc
+from scipy.linalg import cho_factor, cho_solve, cholesky, solve, solve_triangular
+from scipy.optimize import minimize
+
+def tstd2theta(tstd, hard=True):
+        """Given standardized theta in [0, 1]^d, return non-standardized theta."""
+        if tstd.ndim < 1.5:
+            tstd = tstd[:, None].T
+        (Treffs, Hus, LdKw, powparams) = np.split(tstd, tstd.shape[1], axis=1)
+
+        Treff = (0.5 - 0.05) * Treffs + 0.05
+        Hu = Hus * (1110 - 990) + 990
+        if hard:
+            Ld_Kw = LdKw * (1680 / 1500 - 1120 / 15000) + 1120 / 15000
+        else:
+            Ld_Kw = LdKw * (1680 / 9855 - 1120 / 12045) + 1120 / 12045
+
+        powparam = powparams * (0.5 - (- 0.5)) + (-0.5)
+
+        theta = np.hstack((Hu, Ld_Kw, Treff, powparam))
+        return theta
+
+def xstd2x(xstd):
+    """Given standardized x in [0, 1]^2 x {0, 1}, return non-standardized x."""
+    if xstd.ndim < 1.5:
+        xstd = xstd[:, None].T
+    (rws, Hls) = np.split(xstd, xstd.shape[1], axis=1)
+
+    rw = rws * (np.log(0.5) - np.log(0.05)) + np.log(0.05)
+    rw = np.exp(rw)
+    Hl = Hls * (820 - 700) + 700
+
+    x = np.hstack((rw, Hl))
+    return x
+
+def generate_borehole_data_nd(n,p=4, seed=67):
+
+    def borehole_vec(x, theta):
+        """Given x and theta, return vector of values."""
+        (Hu, Ld_Kw, Treff, powparam) = np.split(theta, theta.shape[1], axis=1)
+        (rw, Hl) = np.split(x, x.shape[1], axis=1)
+        numer = 2 * np.pi * (Hu - Hl)
+        denom1 = 2 * Ld_Kw / rw ** 2
+        denom2 = Treff
+
+        f = ((numer / ((denom1 + denom2))) * np.exp(powparam * rw)).reshape(-1)
+        return f
+    
+    x_unit = qmc.LatinHypercube(d=2, scramble=True, rng=seed).random(p)
+    theta_unit = qmc.LatinHypercube(d=4, scramble=True,rng=seed).random(n)
+    
+    
+    x = xstd2x(x_unit)                  # (p,2)
+    theta = tstd2theta(theta_unit)      # (n,4)
+
+    theta_stacked = np.repeat(theta, repeats=p, axis=0)
+    x_stacked = np.tile(x.astype(float), (n, 1))
+
+    def to_m1_1(X):
+        return 2.0 * (X - 0.5)
+    
+    theta_scaled = to_m1_1(theta_unit)
+
+    y = borehole_vec(x_stacked, theta_stacked).reshape((n, p))
+    return {"X_phys": theta, "X_scaled": theta_scaled, "Y": y, 'locations_phys': x}
+        
+
+def generate_forrester_data(n, seed=67):
+    BOUNDS = np.array([[0,1]])
+
+    def f_1(x):
+        return ((6*x-2) ** 2) * np.sin(12*x-4)
+    
+    def f_2(x):
+        return 0.5 * f_1(x) + 5 * (x - 0.5) + 5
+    
+    def f_3(x):
+        return -0.8 * f_1(x) - 5 * (x - 0.5) - 4
+    
+    def lhs_in_bounds(n, bounds=BOUNDS, seed=seed):
+        d = bounds.shape[0]
+        sampler = qmc.LatinHypercube(d=d, scramble=True, rng=seed)
+        U = sampler.random(n)                                  # in [0,1]^d
+        return qmc.scale(U, bounds[:, 0], bounds[:, 1]) 
+    
+    def to_m1_1(X, bounds=BOUNDS):
+        a, b = bounds[:, 0], bounds[:, 1]
+        return 2.0 * (X - a) / (b - a) - 1.0
+
+    
+    X = lhs_in_bounds(n, seed=seed)
+    y = np.array([f_1(X) , f_2(X), f_3(X)]).squeeze().T
+    X_scaled = to_m1_1(X)
+    out = {"X": X, "X_scaled": X_scaled, "y": y}
+    return out
+
+def generate_borehold_data_1d(n, seed=67):
+    # Borehole function: 8 x_j variables
+    BOUNDS = np.array([
+        [0.05, 0.15],
+        [100.0, 5_000.0],
+        [63_070., 115_600.0],
+        [990.0, 1_110.0],
+        [63.1, 116.0],
+        [700.0, 820.0],
+        [1_120.0, 1680.0],
+        [9_855.0, 12_045.0],
+    ])
+
+    def borehole_y(X_phys):
+        x1, x2, x3, x4, x5, x6, x7, x8 = X_phys.T
+        log_term = np.log(x2 / x1)
+        denom = log_term * (1.0 + (2.0 * x7 * x3) / (log_term * x1**2 * x8) + (x3 / x5))
+        return (2.0 * np.pi * x3 * (x4 - x6)) / denom
+    
+
+
+    def lhs_in_bounds(n, bounds=BOUNDS, seed=seed):
+        d = bounds.shape[0]
+        sampler = qmc.LatinHypercube(d=d, scramble=True, rng=seed)
+        U = sampler.random(n)                                  # in [0,1]^d
+        return qmc.scale(U, bounds[:, 0], bounds[:, 1]) 
+    
+    def to_m1_1(X_phys, bounds=BOUNDS):
+        a, b = bounds[:, 0], bounds[:, 1]
+        return 2.0 * (X_phys - a) / (b - a) - 1.0
+
+    
+    X_phys = lhs_in_bounds(n, seed=seed)
+    y = borehole_y(X_phys)
+    X_scaled = to_m1_1(X_phys)
+    out = {"X_phys": X_phys, "X_scaled": X_scaled, "y": y}
+    
+    return out
+
+# Create Design Matrix
+def make_G(data, terms, one_based=True, return_names=False):
+    """
+     Creates n x r design matrix of the form
+    
+    Input terms as list:
+    e.g. ->  terms = [None, 1, 2, 3]
+    This results in g(x) = [1, x1, x2, x3]
+    """
+    
+    
+
+    X = np.asarray(data['X_scaled'])
+    n, d = X.shape
+    
+    cols = []
+    names = []
+
+    def add_col(name, col):
+            cols.append(col.reshape(n, 1))
+            names.append(name)
+
+    for t in terms:
+        # None -> Intercept
+        if t is None:
+            add_col('1', np.ones(n))
+            continue
+
+        # int -> Single Effect
+        if isinstance(t, (int, np.integer)):
+            j = t - 1 if one_based else t
+            if j < 0 or j >= d:
+                raise ValueError(f"Index {t} out of range for d={d} (one_based={one_based}).")
+            add_col(f'x{j+1}', X[:, j])
+            continue
+
+        # (int, int) -> Interaction
+        else:
+            try:
+                idxs = [(i - 1) if one_based else int(i) for i in t]
+            except Exception as e:
+                raise ValueError(f"Unrecognized term: {t}") from e
+
+        if len(idxs) < 2:
+            raise ValueError(f"Interactions must have length >= 2; got {t}")
+        if any((i < 0 or i >= d) for i in idxs):
+            raise ValueError(f"Some indices in {t} are out of range for d={d}.")
+
+
+        prod = np.prod(X[:, idxs], axis=1)
+        name = '*'.join([f'x{i+1}' for i in idxs])
+        add_col(name, prod)
+
+    G = np.hstack(cols) if cols else np.empty((n, 0))
+    return (G, names) if return_names else G
+
+
+# Covariance analytical integrals
+def M_gauss(x, ell, sigma2=1.0):
+    x = np.asarray(x)
+    return (sqrt(pi) * sigma2 * ell / 2.0) * (erf((x + 1.0)/ell) - erf((x - 1.0)/ell))
+
+def L_gauss(x, ell, sigma2=1.0):
+    x = np.asarray(x)
+    return (sigma2 * (ell**2) / 2.0) * (exp(-((x + 1.0)/ell)**2) - exp(-((x - 1.0)/ell)**2)) + x * M_gauss(x, ell, sigma2)
+
+def IM_gauss(ell, sigma2=1.0):
+    return 2.0 * sqrt(pi) * sigma2 * ell * erf(2.0/ell) - sigma2 * (ell**2) * (1.0 - exp(-4.0/(ell**2)))
+
+def IL_gauss(ell, sigma2=1.0):
+    return 0.0
+
+def ILL_gauss(ell, sigma2=1.0):
+    return (sigma2 * (ell**4) / 6.0) * (1.0 - exp(-4.0/(ell**2))) \
+         - (sigma2 * (ell**2) / 3.0) * (3.0 - exp(-4.0/(ell**2))) \
+         + (2.0 * sqrt(pi) * sigma2 * ell / 3.0) * erf(2.0/ell)
+
+
+def make_c_star_matrix(X, Xp, ell, sigma2, terms, one_based=True):
+    """
+    Compute C*(X, X') with Eq (2.3) c* = c - h^T H \inv h' (matrix version)
+    Inputs:
+      X, Xp : (n,d), (m,d) in [-1,1]^d
+      ell   : (d,) lengthscales
+      sigma2: variance (scale)
+      terms : list defining g(x) structure (same format as in make_G)
+    """
+    def _parse_terms_to_sets(terms, d, one_based=True):
+        """
+        Map each term to its index set J_i ⊆ {0,...,d-1}.
+        None  -> empty set
+        int j -> {j-1} (if one_based) or {j} (if not)
+        list of ints -> set of indices
+        """
+        J_sets = []
+        for t in terms:
+            if t is None:
+                J_sets.append(tuple())                  # intercept = empty set
+                continue
+            if isinstance(t, (int, np.integer)):        # single term = int
+                j = t-1 if one_based else t
+                if not (0 <= j < d):
+                    raise ValueError(f'Index {t} out of range for d={d}')
+                J_sets.append((j,))
+                continue
+            else:                                       # list = interaction
+                idxs = [(i-1) if one_based else int(i) for i in t]
+
+            if any(i < 0 or i >= d for i in idxs):
+                raise ValueError(f'Indices {idxs} out of range for d={d}')
+            if len(set(idxs)) != len(idxs):
+                raise ValueError(f'Duplicate indices in interaction {t}')
+            if len(idxs) < 2:
+                raise ValueError(f'Interactions must have length ≥2; got {t}')
+            J_sets.append(tuple(sorted(idxs)))
+        return J_sets  # list of tuples
+    
+    def _base_se_kernel(X, Xp, ell, sigma2=1.0):
+        """Separable squared-exp with lengthscales ell (shape: (d,))."""
+
+        X = np.asarray(X)
+        Xp = np.asarray(Xp)
+        ell = np.asarray(ell)
+        dif = (X[:, None, :] - Xp[None, :, :]) / ell  # (n, m, d)
+        D2 = np.sum(dif * dif, axis=2)
+
+        return sigma2 * np.exp(-D2)
+    
+
+    def _h_matrix(X, ell, sigma2, J_sets):
+        """
+        Build h(X) matrix (shape: n x p)
+        Each column is h(x_i), i=1,...,n where is i the data index (x_i \in \R^d)
+        See formulas (2.2) and (3.3)
+        """
+        X = np.asarray(X)
+        n, d = X.shape
+        p = len(J_sets)
+
+        # Precompute M_j and L_j for all coords (shape: n×d)
+        M_all = np.empty((n, d))
+        L_all = np.empty((n, d))
+        for j in range(d):
+            M_all[:, j] = M_gauss(X[:, j], ell[j], sigma2=1.0)
+            L_all[:, j] = L_gauss(X[:, j], ell[j], sigma2=1.0)
+
+        Hcols = np.empty((n, p))
+        all_idx = set(range(d))
+        for i, Ji in enumerate(J_sets):
+            Ji = set(Ji)
+            notJ = list(all_idx - Ji)
+            Ji   = list(Ji)
+            col = np.ones(n)
+            if notJ:
+                col *= np.prod(M_all[:, notJ], axis=1)
+            if Ji:
+                col *= np.prod(L_all[:, Ji], axis=1)
+            Hcols[:, i] = col
+        return Hcols * sigma2  # n×p
+    
+    def _H_diag(ell, sigma2, J_sets):
+        """
+        Build H(X) matrix. See formula (2.2) & (3.3)
+        """
+        ell = np.asarray(ell)
+        d = len(ell)
+        IM = np.array([IM_gauss(ell[j], sigma2=1.0)  for j in range(d)])
+        ILL= np.array([ILL_gauss(ell[j], sigma2=1.0) for j in range(d)])
+
+        Hdiag = []
+        all_idx = set(range(d))
+        for Ji in J_sets:
+            Ji = set(Ji)
+            notJ = list(all_idx - Ji)
+            Ji   = list(Ji)
+            val = 1.0
+            if notJ:
+                val *= np.prod(IM[notJ])
+            if Ji:
+                val *= np.prod(ILL[Ji])
+            Hdiag.append(val)
+        Hdiag = np.asarray(Hdiag)
+        if np.any(Hdiag <= 0):
+            raise RuntimeError("Non-positive H diagonal (check ell/domain).")
+        return Hdiag * sigma2  # shape (p,)
+    
+    
+    X  = np.asarray(X)  
+    Xp = np.asarray(Xp)
+    d  = X.shape[1]
+    J_sets = _parse_terms_to_sets(terms, d, one_based=one_based)
+
+    # Base covariance
+    C = _base_se_kernel(X, Xp, ell, sigma2=sigma2)
+
+    if len(J_sets) == 0:
+        return C 
+
+    # h(X), h(X')
+    hX  = _h_matrix(X,  ell, sigma2, J_sets)     # n×p
+    hXp = _h_matrix(Xp, ell, sigma2, J_sets)     # m×p
+
+    # H diagonal and H^{-1}
+    Hdiag = _H_diag(ell, sigma2, J_sets)         # (p,)
+    Hinvd = 1.0 / Hdiag                          # (p,)
+
+    # c* = c - h(X) diag(H^{-1}) h(X')^T
+    C_corr = (hX * Hinvd) @ hXp.T          # n×m
+    return C - C_corr
+
+def build_Gy(G,p):
+    return np.kron(np.eye(p), G)
+
+def vecF(A):
+    """vec with column-stacking"""
+    return A.reshape(-1, order='F')
+
+def unvecF(v, r, p):
+    """inverse of vecF."""
+    return v.reshape((r, p), order='F')
+
+def gls_bhat(Y, G, Ky_chol):
+    """
+    \widehat{\vec{\mat{B}}} &= \left((\mat{I}_p \otimes \mat{G})\transpose \mat{K}_y\inv (\mat{I}_p \otimes \mat{G})  \right) \inv (\mat{I}_p \otimes 
+    See Eq (8) of Ortho LMC
+    Parameters
+    ----------
+    Y    : (n,p)
+    G    : (n,r)
+    Ky_chol: (np, np) -> Cov(vec(y))
+    
+    """
+
+    n, p = Y.shape
+    r = G.shape[1] 
+    Gy = build_Gy(G,p)
+
+    z = cho_solve(Ky_chol, Gy) # z = K_y \inv (I_p \otimes G)
+    alpha = cho_solve(Ky_chol, vecF(Y)) # \alpha = K_y \inv vec(Y)
+
+    A = Gy.T @ z     # = (Ip \otimes G)\transpose K_y \inv (Ip \otimes G)
+    b = Gy.T @ alpha # (Ip \otimes G)\transpose K_y \inv vec(Y)
+
+    # Solve A \hat{B} = b
+    beta_vec = solve(A, b, assume_a='sym')
+    return unvecF(beta_vec,r,p)
+
+def unpack_theta(theta_raw, d, q, p, learn_Psi=False, normalize_rows=True):
+    """
+    flatten theta to 1d array
+
+    r: number of elements in g(x)
+    q: number of gaussian processes in g(x)
+    p: number of output locations in data
+    """
+    t = np.asarray(theta_raw).ravel()
+    base = q*(d+1) # number of params excluding Psi
+    if t.size < base:
+        raise ValueError(f"theta length {t.size} < required {base}")
+
+    lat = t[:base]
+    lat_params = []
+    off = 0
+    for j in range(q): 
+        log_s2 = lat[off]
+        off += 1
+        log_ell = lat[off:off+d]
+        off += d
+        lat_params.append((float(np.exp(log_s2)), np.exp(log_ell)))
+    if not learn_Psi:
+        return lat_params, None
+    
+    # learn Psi
+    Psi_free = t[base:].reshape(p,q)
+    Psi = Psi_free.copy()
+    if normalize_rows:
+        for j in range(q):
+            nrm = norm(Psi[:,j]) or 1.0
+            Psi[:,j] /= nrm
+    return lat_params, Psi
+
+def build_Ky(Cjs, Psi):
+    n = Cjs[0].shape[0]
+    p,q = Psi.shape
+
+    assert q == len(Cjs)
+
+    Ky = np.zeros((n*p, n*p))
+    for j in range(q):
+        Wj = np.outer(Psi[:,j], Psi[:,j])
+        Ky += np.kron(Wj, Cjs[j])
+    return Ky
+
+
+def build_cross_K(Psi, Cj_list):
+    nstar, m = Cj_list[0].shape
+    p,q = Psi.shape
+    K = np.zeros((nstar*p, m*p))
+    for j in range(q):
+        Wj = np.outer(Psi[:,j], Psi[:,j])  # (p×p)
+        K += np.kron(Wj, Cj_list[j])
+    return K
+
+
+def nll_mo_ogp(theta_raw,
+               data,
+               terms,
+               Psi_fixed=None,
+               *,
+               use_reml=True,
+               jitter=1e-6,
+               one_based=True,
+               learn_Psi=False,
+               normalize_rows=True,
+               return_cache=False):
+    """
+    Negative log-likelihood that optimizes over (sigma^2, ell).
+
+    Parameters
+    ----------
+    theta_raw : array-like, shape (1 + d,)
+        Packed as [log_sigma2, log_ell_1, ..., log_ell_d] (unconstrained).
+    data : dict
+        Contains 'X_scaled' (n,d) in [-1,1]^d and 'y' (n,p).
+    terms : list
+        Structure of g(x): None for intercept, ints for main effects, lists/tuples for interactions.
+    use_reml : bool
+        If True, add the REML correction (+ 0.5 log|G^T C^{-1} G|) and profile with n-p dof.
+        If False, standard ML (no correction).
+    jitter : float
+        Small diagonal added to C for numerical stability.
+    """
+    X = np.asarray(data['X_scaled'])
+    Y = np.asarray(data.get('Y', data.get('y'))) 
+    n, d = X.shape
+    p = Y.shape[1]
+
+    # Unpack parameters
+    if learn_Psi:
+        if Psi_fixed is None:
+            raise ValueError("When learnPsi=True, supply Psi_fixed as np.empty((p,q))")
+        q = Psi_fixed.shape[1]
+        lat_params, Psi = unpack_theta(theta_raw, d, q, p, learn_Psi=True, normalize_rows=normalize_rows)
+    else:
+        if Psi_fixed is None:
+            raise ValueError("Provide Psi_fixed (p x q) when learn_Psi=False.")
+        q = Psi_fixed.shape[1]
+        lat_params, _ = unpack_theta(theta_raw, d, q, p, learn_Psi=False)
+        Psi = Psi_fixed
+
+    # Design Matrices
+    G = make_G(data, terms, one_based=one_based, return_names=False) # n x r
+    r = G.shape[1] if G.size else 0
+    Gy = build_Gy(G, p) if r > 0 else np.empty((n*p, 0))
+    
+    # Make Covariance matrix for each latent
+    Cj_list = []
+    for (sigma2_j, ell_j) in lat_params:
+        Cj = make_c_star_matrix(X,X, ell=ell_j, sigma2=sigma2_j, terms=terms, one_based=one_based)
+        Cj_list.append(Cj)
+
+    # Build Ky
+    Ky = build_Ky(Cj_list, Psi)
+    if jitter:
+        Ky = Ky + jitter * np.eye(n*p)
+    Ky_chol = cho_factor(Ky, lower=True, check_finite=False)
+
+    if r > 0:
+        bhat = gls_bhat(Y,G, Ky_chol)
+        rvec = vecF(Y) - Gy @ vecF(bhat)    # residual vector
+    else:
+        bhat = np.zeros((0, p))
+        rvec = vecF(Y)
+    
+    qf = float(rvec @ cho_solve(Ky_chol,rvec, check_finite=False))
+    logdetK = 2 * np.sum(np.log(np.diag(Ky_chol[0])))
+
+    nll = 0.5 * (logdetK + qf + (n*p) * np.log(2.0*np.pi))
+
+    if use_reml:
+        pass
+    else:
+        A = None
+
+    if not return_cache:
+        return nll
+    
+    cache = dict(Ky=Ky, Ky_chol=Ky_chol, Cj_list=Cj_list, Psi=Psi,
+                 G=G, Gy=Gy, bhat=bhat, residual_vec=rvec, qf=qf, logdetK=logdetK,
+                 A=A, lat_params=lat_params, terms=terms, one_based=one_based, X=X, Y=Y)
+    return nll, cache
+
+def fit_mo_ogp(data, terms, q, Psi, theta0, bounds=None,
+               *, use_reml=True, jitter=1e-6, one_based=True,
+               learn_Psi=False, normalize_rows=True, optimizer_opts=None):
+    """
+    Fits multi-output OGP and returns (res, model) where model holds caches for prediction.
+    Psi: (q x p) mixing (fixed if learn_Psi=False). If learn_Psi=True, Psi is only used for shape.
+    """
+    X = np.asarray(data['X_scaled'])
+    Y = np.asarray(data.get('Y', data.get('y')))
+    p = Y.shape[1]
+
+    if Psi is None:
+        raise ValueError("Provide Psi (p x q). If learning Psi, pass a dummy of correct shape.")
+
+    obj = lambda th: nll_mo_ogp(th, data, terms, Psi_fixed=Psi,
+                                use_reml=use_reml, jitter=jitter, one_based=one_based,
+                                learn_Psi=learn_Psi, normalize_rows=normalize_rows)
+
+    res = minimize(obj, theta0, method="L-BFGS-B", bounds=bounds,
+                   options={"maxiter": 200, **(optimizer_opts or {})})
+
+    # cache at optimum
+    nll, cache = nll_mo_ogp(res.x, data, terms, Psi_fixed=Psi,
+                            use_reml=use_reml, jitter=jitter, one_based=one_based,
+                            learn_Psi=learn_Psi, normalize_rows=normalize_rows,
+                            return_cache=True)
+
+    model = dict(cache=cache, theta_hat=res.x, terms=terms, q=q, p=p,
+                 use_reml=use_reml, jitter=jitter, one_based=one_based)
+    return res, model
+
+
+def predict_mo_ogp(model, Xstar, return_std=False, diag_only=True, include_mean_uncertainty=False):
+    """
+    Predict at Xstar for fitted multi-output OGP (A1).
+    Returns mean (n*×p) and optionally std (n*×p).
+    """
+    cache = model['cache']
+    terms = model['terms']
+    one_based = model['one_based']
+    use_reml = model['use_reml']
+
+    X = cache['X']
+    Y = cache['Y']
+    Psi = cache['Psi']
+    lat_params = cache['lat_params']
+    Gy = cache['Gy'] 
+    bhat = cache['bhat']
+    Ky_chol = cache['Ky_chol']
+    A = cache['A']
+    p = Y.shape[1]
+
+    Xs = np.asarray(Xstar)
+    nstar = Xs.shape[0]
+
+    # Per-latent cross and test covariances
+    Cj_XsX  = []
+    Cj_XsXs = []
+    for (sigma2_j, ell_j) in lat_params:
+        Cj1 = make_c_star_matrix(Xs, X,  ell=ell_j, sigma2=sigma2_j, terms=terms, one_based=one_based)
+        Cj2 = make_c_star_matrix(Xs, Xs, ell=ell_j, sigma2=sigma2_j, terms=terms, one_based=one_based)
+        Cj_XsX.append(Cj1); Cj_XsXs.append(Cj2)
+
+    K_XsX  = build_cross_K(Psi, Cj_XsX)   # (n* p × n p)
+    K_XsXs = build_cross_K(Psi, Cj_XsXs)  # (n* p × n* p)
+
+    # predictive mean: vec(μ*) = (I_p ⊗ Gs) vec(bhat) + K_XsX K^{-1} r
+    Gs = make_G({"X_scaled": Xs}, terms, one_based=one_based, return_names=False)
+    Gs_y = build_Gy(Gs, p) if Gs.size else np.empty((nstar*p, 0))
+    rvec = cache['residual_vec']  # vec(Y) - (Gy vec(bhat))
+
+    mean_vec = (Gs_y @ vecF(bhat)) if Gs.size else np.zeros(nstar*p)
+    mean_vec += K_XsX @ cho_solve(Ky_chol, rvec, check_finite=False)
+    mean = unvecF(mean_vec, nstar, p)
+
+    if not return_std:
+        return mean
+
+    # predictive variance (diag by default)
+    V = cho_solve(Ky_chol, K_XsX.T, check_finite=False)  # (n p × n* p)
+    diag_prior = np.einsum('ii->i', K_XsXs)
+    diag_cross = np.sum(K_XsX * V.T, axis=1)
+    diag = diag_prior - diag_cross
+
+    if include_mean_uncertainty and Gs.size and use_reml and (A is not None):
+        M = Gs_y - K_XsX @ cho_solve(Ky_chol, Gy, check_finite=False)
+        W = solve(A, M.T, assume_a='sym')
+        diag += np.sum(M * W.T, axis=1)
+
+    std = np.sqrt(np.maximum(diag, 0.0))
+    return mean, unvecF(std, nstar, p)
+
+
+def borehole_vec_physical(x, theta):
+    """
+    Compare to ground truth at the same x, theta values
+    """
+    (Hu, Ld_Kw, Treff, powparam) = np.split(theta, theta.shape[1], axis=1)
+    (rw, Hl) = np.split(x, x.shape[1], axis=1)
+    numer = 2*np.pi*(Hu - Hl)
+    denom1 = 2*Ld_Kw/(rw**2)
+    denom2 = Treff
+    return ((numer/(denom1 + denom2)) * np.exp(powparam * rw)).reshape(-1)
+
+
+
+
+
+if __name__ == "__main__":
+    # 1) Train set
+    data = generate_borehole_data_nd(n=100, seed=67)
+    X = data["X_scaled"]
+    Y = data["Y"]
+
+    # 2) Choose mean basis g(x): intercept + main effects
+    d = X.shape[1]
+    terms = [None] + list(range(1, d+1)) 
+
+    # 3) Set latent count and Psi
+    q = 4
+    p = Y.shape[1]
+    rng = np.random.default_rng(0)
+    Psi = rng.standard_normal((p, q))
+    Psi /= np.maximum(np.linalg.norm(Psi, axis=0, keepdims=True), 1e-12) 
+
+    # 4) Build initial theta and bounds
+    theta0 = []
+    bounds = []
+    for j in range(q):
+        theta0 += [np.log(1.0)]
+        theta0 += list(np.log(0.5)*np.ones(d))
+        bounds += [(np.log(1e-6), np.log(1e3))] + [(np.log(0.05), np.log(5.0))]*d
+    
+    t0 = time.perf_counter()
+    # Fit ML
+    res, model = fit_mo_ogp(
+        data=data,
+        terms=terms,
+        q=q,
+        Psi=Psi,
+        theta0=theta0,
+        bounds=bounds,
+        use_reml=False,
+        jitter=1e-6,
+        learn_Psi=False
+    )
+    elapsed = time.perf_counter() - t0
+    print(f"Training took {elapsed:.3f} s")
+    print("Optimization success:", res.success, "  NLL:", res.fun)
+
+    # 6) Predict at new points
+    n_star = 30
+    theta_star_u = qmc.LatinHypercube(d=d, scramble=True, rng=999).random(n_star)
+    theta_star_scaled = 2.0*(theta_star_u - 0.5) 
+    Y_mean, Y_std = predict_mo_ogp(model, theta_star_scaled, return_std=True)
+
+    print("Pred mean shape:", Y_mean.shape, "  Pred std shape:", Y_std.shape)
+
+    # 7) Compare to ground truth
+
+    locations_phys = data['locations_phys']
+    theta_star_phys = tstd2theta(theta_star_u)
+
+    theta_stack = np.repeat(theta_star_phys, repeats=p, axis=0) 
+    x_stack     = np.tile(locations_phys, (n_star, 1)) 
+
+    Y_true = borehole_vec_physical(x_stack, theta_stack).reshape(n_star, p)
+
+    rmse = np.sqrt(np.mean((Y_mean - Y_true)**2, axis=0))
+    print("RMSE per output:", rmse)
