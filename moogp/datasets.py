@@ -47,8 +47,8 @@ def generate_borehole_data_nd(n,p=4, seed=67):
         f = ((numer / ((denom1 + denom2))) * np.exp(powparam * rw)).reshape(-1)
         return f
     
-    x_unit = qmc.LatinHypercube(d=2, scramble=True, rng=seed).random(p)
-    theta_unit = qmc.LatinHypercube(d=4, scramble=True,rng=seed).random(n)
+    x_unit = qmc.LatinHypercube(d=2, scramble=True, seed=seed).random(p)
+    theta_unit = qmc.LatinHypercube(d=4, scramble=True,seed=seed).random(n)
     
     
     x = xstd2x(x_unit)                  # (p,2)
@@ -80,7 +80,7 @@ def generate_forrester_data(n, seed=67):
     
     def lhs_in_bounds(n, bounds=BOUNDS, seed=seed):
         d = bounds.shape[0]
-        sampler = qmc.LatinHypercube(d=d, scramble=True, rng=seed)
+        sampler = qmc.LatinHypercube(d=d, scramble=True, seed=seed)
         U = sampler.random(n)                                  # in [0,1]^d
         return qmc.scale(U, bounds[:, 0], bounds[:, 1]) 
     
@@ -118,7 +118,7 @@ def generate_borehold_data_1d(n, seed=67):
 
     def lhs_in_bounds(n, bounds=BOUNDS, seed=seed):
         d = bounds.shape[0]
-        sampler = qmc.LatinHypercube(d=d, scramble=True, rng=seed)
+        sampler = qmc.LatinHypercube(d=d, scramble=True, seed=seed)
         U = sampler.random(n)                                  # in [0,1]^d
         return qmc.scale(U, bounds[:, 0], bounds[:, 1]) 
     
