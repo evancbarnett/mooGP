@@ -1,5 +1,4 @@
 .venv/
 .vscode/
-moogp/__pycache__/
-moogp/tests/__pycache__/
-.pytest_cachce
+**/__pycache__/
+.pytest_cache/
