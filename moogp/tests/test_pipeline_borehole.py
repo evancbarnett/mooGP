@@ -32,6 +32,7 @@ def test_moogp_borehole_small_q_equals_p():
         q=q_latent,
         Psi=Psi,
         learn_Psi=False,
+        learn_sigma_eps=False,
         use_reml=False,
         jitter=1e-8,
     )

@@ -47,7 +47,7 @@ def fit_moogp_forrester(n_train=25, seed=0,q=3, learn_psi=False):
         use_reml=False,
         jitter=1e-2,
         one_based=True,
-        normalize_rows=True,
+        normalize_cols=True,
     )
 
     # 4) Build theta0 and bounds

@@ -51,7 +51,7 @@ def test_unpack_theta_basic_splits():
         theta_raw += list(np.log(0.5) * np.ones(d))  # log ells
     theta_raw = np.array(theta_raw)
 
-    lat_params, Psi = unpack_theta(theta_raw, d=d, q=q, p=p, learn_Psi=False)
+    lat_params, Psi, _ = unpack_theta(theta_raw, d=d, q=q, p=p, learn_Psi=False, learn_sigma_eps=False)
 
     assert len(lat_params) == q
     for (sigma2_j, ell_j) in lat_params:

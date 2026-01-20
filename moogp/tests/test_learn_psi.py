@@ -25,10 +25,11 @@ def test_learn_psi():
         q=q,
         Psi=None,
         learn_Psi=True,
+        learn_sigma_eps=False,
         use_reml=False,
         jitter=1e-6,
         one_based=True,
-        normalize_rows=True,
+        normalize_cols=True,
     )
 
     # Prepare internal X/Y/n/d/p
@@ -78,7 +79,7 @@ def test_learn_psi():
     # Shape (p, q)
     assert Psi_hat.shape == (p, q)
 
-    # Each column should be unit norm due to normalize_rows=True
+    # Each column should be unit norm due to normalize_cols=True
     col_norms = np.linalg.norm(Psi_hat, axis=0)
     assert np.allclose(col_norms, np.ones(q), atol=1e-6)
 
@@ -87,8 +88,8 @@ def test_learn_psi():
     assert mean.shape == Y.shape
     assert std.shape == Y.shape
     
-    thetanot, psinot = unpack_theta(theta0, d,q,p,learn_Psi=True)
-    thetahat, psihat = unpack_theta(model.theta_hat, d,q,p,learn_Psi=True)
+    thetanot, psinot, _ = unpack_theta(theta0, d,q,p,learn_Psi=True, learn_sigma_eps=False)
+    thetahat, psihat, _ = unpack_theta(model.theta_hat, d,q,p,learn_Psi=True, learn_sigma_eps=False)
     
     print(f"Starting Psi: {psinot}")
     print(f"Fitted Psi: {psihat}")
