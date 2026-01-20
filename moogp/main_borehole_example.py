@@ -41,6 +41,7 @@ if __name__ == "__main__":
         q=q,
         Psi=Psi,
         learn_Psi=False,
+        learn_sigma_eps=False,
         use_reml=False,
         jitter=1e-6,
     )

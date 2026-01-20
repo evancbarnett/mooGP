@@ -7,18 +7,38 @@ from .design import make_G, build_Gy, vecF, unvecF
 from .kernels import make_c_star_matrix
 
 
-def unpack_theta(theta_raw, d, q, p, learn_Psi=False, normalize_rows=True):
+def unpack_theta(
+    theta_raw,
+    d,
+    q,
+    p,
+    *,
+    learn_Psi=False,
+    learn_sigma_eps=False,
+    normalize_cols=True,
+):
     """
-    flatten theta to 1d array
+    Unpack the unconstrained optimization vector
 
     r: number of elements in g(x)
     q: number of gaussian processes in g(x)
+    d: length of g(x)
     p: number of output locations in data
+
+    Packing order:
+      1) Latent kernel hyperparams for each k=1..q:
+           [log(sigma2_k), log(ell_{k1}), ..., log(ell_{kd})]
+         => total length q*(d+1)
+      2) Optional Psi (if ``learn_Psi=True``): p*q free entries
+      3) Optional diagonal measurement noise variances (if ``learn_sigma_eps=True``):
+           [log(sigma^2_{eps,1}), ..., log(sigma^2_{eps,p})]
+
     """
+     # flatten array to 1d
     t = np.asarray(theta_raw).ravel()
-    base = q*(d+1) # number of params excluding Psi
+    base = q * (d + 1)  # number of latent-kernel hyperparameters
     if t.size < base:
-        raise ValueError(f"theta length {t.size} < required {base}")
+        raise ValueError(f"theta length {t.size} < required latent {base}")
 
     lat = t[:base]
     lat_params = []
@@ -29,31 +49,56 @@ def unpack_theta(theta_raw, d, q, p, learn_Psi=False, normalize_rows=True):
         log_ell = lat[off:off+d]
         off += d
         lat_params.append((float(np.exp(log_s2)), np.exp(log_ell)))
-    if not learn_Psi:
-        return lat_params, None
-    
-    # learn Psi
-    Psi_free = t[base:].reshape(p,q)
-    Psi = Psi_free.copy()
-    if normalize_rows:
-        for j in range(q):
-            nrm = norm(Psi[:,j]) or 1.0
-            Psi[:,j] /= nrm
-    return lat_params, Psi
+    off = base
 
-def build_Ky(Cjs, Psi):
+    Psi = None
+    if learn_Psi:
+        need = p * q
+        if t.size < off + need:
+            raise ValueError(f"theta length {t.size} < required latent+Psi {off+need}")
+        Psi_free = t[off:off + need].reshape(p, q)
+        off += need
+
+        Psi = Psi_free.copy()
+        if normalize_cols:
+            for j in range(q):
+                nrm = norm(Psi[:, j]) or 1.0 # prevent divide by zero 
+                Psi[:, j] /= nrm
+
+    sigma_eps2 = None
+    if learn_sigma_eps:
+        need = p
+        if t.size < off + need:
+            raise ValueError(f"theta length {t.size} < required +Sigma_eps {off+need}")
+        log_sigma = t[off:off + need]
+        off += need
+        sigma_eps2 = np.exp(log_sigma).astype(float)
+
+    return lat_params, Psi, sigma_eps2
+
+def build_Ky(Cjs, Psi, sigma_eps2 = None):
     n = Cjs[0].shape[0]
     p,q = Psi.shape
 
     assert q == len(Cjs)
 
-    Ky = np.zeros((n*p, n*p))
+    # build covariance without measurement noise
+    Ky = np.zeros((n * p, n * p))
     for j in range(q):
         Wj = np.outer(Psi[:,j], Psi[:,j])
         Ky += np.kron(Wj, Cjs[j])
+
+    # add diagonal measurement noise 
+    if sigma_eps2 is not None:
+        sigma_eps2 = np.asarray(sigma_eps2, float).ravel()
+        if sigma_eps2.size != p:
+            raise ValueError(f"sigma_eps2 length {sigma_eps2.size} needs to equal p={p}")
+        Ky += np.kron(np.diag(sigma_eps2), np.eye(n))
     return Ky
 
+
 def build_cross_K(Psi, Cj_list):
+    # train-test covariance matrix
     nstar, m = Cj_list[0].shape
     p,q = Psi.shape
     K = np.zeros((nstar*p, m*p))
@@ -64,8 +109,7 @@ def build_cross_K(Psi, Cj_list):
 
 def gls_bhat(Y, G, Ky_chol):
     """
-    \widehat{\vec{\mat{B}}} &= \left((\mat{I}_p \otimes \mat{G})\transpose \mat{K}_y\inv (\mat{I}_p \otimes \mat{G})  \right) \inv (\mat{I}_p \otimes 
-    See Eq (8) of Ortho LMC
+    \widehat{\vec{\mat{B}}} &= \left((\mat{I}_p \otimes \mat{G})\transpose \mat{K}_y\inv (\mat{I}_p \otimes \mat{G})  \right) \inv (\mat{I}_p \otimes \mat{G}) \transpose \mat{K}_y \inv \vec{Y}
     Parameters
     ----------
     Y    : (n,p)
@@ -99,10 +143,13 @@ class MOOGP:
                  Psi=None,
                  *,
                  learn_Psi=False,
+                 sigma_eps2=None,
+                 learn_sigma_eps=None,
+                 min_sigma_eps2=1e-10,
                  use_reml=False,
                  jitter=1e-6,
                  one_based=True,
-                 normalize_rows=True):
+                 normalize_cols=True):
         """
         Parameters
         ----------
@@ -114,24 +161,38 @@ class MOOGP:
             Initial / fixed mixing matrix. If learn_Psi=False, this must be provided.
             If learn_Psi=True, it's used for shape.
         learn_Psi : bool
-            If True, theta also parameterizes Psi (like your original unpack_theta).
+            If True, theta also parameterizes Psi.
+        sigma_eps2: (p,) array or None
+            Vector for measurement error
+        learn_sigma_eps2: bool
+            If True, optimize finds values for diagonal heterogeneous error parameters
+        min_sigma_eps2: float
+            Minimum value for output measurement error
         use_reml : bool
             Placeholder for REML; currently same as ML if True.
         jitter : float
             Diagonal jitter for Ky.
         one_based : bool
             Interpret integers in `terms` as 1-based indices.
-        normalize_rows : bool
+        normalize_cols : bool
             Whether to normalize each column of Psi when learning.
         """
         self.terms = terms
         self.q = q
         self.Psi = None if Psi is None else np.asarray(Psi, float)
         self.learn_Psi = learn_Psi
+        self.sigma_eps2 = None if sigma_eps2 is None else np.asarray(sigma_eps2, float).ravel()
+        
+        # If the user doesn't specify, default to learning Sigma_eps when not provided.
+        if learn_sigma_eps is None:
+            learn_sigma_eps = (self.sigma_eps2 is None) 
+        self.learn_sigma_eps = bool(learn_sigma_eps)
+        
+        self.min_sigma_eps2 = float(min_sigma_eps2)
         self.use_reml = use_reml
         self.jitter = jitter
         self.one_based = one_based
-        self.normalize_rows = normalize_rows
+        self.normalize_cols = normalize_cols
 
         self._data = None
         self.cache = None
@@ -157,38 +218,56 @@ class MOOGP:
             if self.Psi.shape != (p, self.q):
                 raise ValueError(f"Psi shape {self.Psi.shape} ≠ (p={p}, q={self.q})")
 
+        if (self.sigma_eps2 is not None) and (self.sigma_eps2.size != p):
+            raise ValueError(f"sigma_eps2 length {self.sigma_eps2.size} ≠ p={p}")
+        
     def _nll(self, theta_raw):
         """
-        Negative log-likelihood that optimizes over (sigma^2, ell).
+        Negative log-likelihood for the MOOGP model.
 
         Parameters
         ----------
-        theta_raw : array-like, shape (1 + d,)
-            Packed as [log_sigma2, log_ell_1, ..., log_ell_d] (unconstrained).
+        ``theta_raw`` follows the packing described in :func:`unpack_theta`.
         """
         X, Y, n, d, p = self.X, self.Y, self.n, self.d, self.p
         terms = self.terms
 
-        # unpack hyperparameters
-        if self.learn_Psi:
-            if self.Psi is None:
-                # we only need Psi shape for unpacking
-                Psi_shape = (p, self.q)
-            else:
-                Psi_shape = self.Psi.shape
-            lat_params, Psi = unpack_theta(
-                theta_raw, d, self.q, p,
-                learn_Psi=True,
-                normalize_rows=self.normalize_rows,
+        # If learning Psi or Sigma_eps, then include in theta (parameters to optimize)
+        if self.learn_Psi or self.learn_sigma_eps:
+            lat_params, Psi_th, sigma_eps2_th = unpack_theta(
+                theta_raw,
+                d,
+                self.q,
+                p,
+                learn_Psi=self.learn_Psi,
+                learn_sigma_eps=self.learn_sigma_eps,
+                normalize_cols=self.normalize_cols,
             )
+            Psi = Psi_th if self.learn_Psi else self.Psi
+            sigma_eps2 = sigma_eps2_th if self.learn_sigma_eps else self.sigma_eps2
+        
+        # Not optimizing over Psi and Sigma_eps 
+        # Psi must be provided while Sigma_eps can be zero (deterministic case: no measurement noise)
         else:
             if self.Psi is None:
                 raise ValueError("Provide Psi when learn_Psi=False.")
-            lat_params, _ = unpack_theta(
-                theta_raw, d, self.q, p,
+            lat_params, _, _ = unpack_theta(
+                theta_raw,
+                d,
+                self.q,
+                p,
                 learn_Psi=False,
+                learn_sigma_eps=False,
             )
             Psi = self.Psi
+            sigma_eps2 = self.sigma_eps2
+
+        if Psi is None:
+            raise ValueError("Psi is None. Provide Psi or set learn_Psi=True.")
+
+        if sigma_eps2 is None:
+            sigma_eps2 = np.zeros(p, dtype=float)
+        sigma_eps2 = np.maximum(np.asarray(sigma_eps2, float).ravel(), self.min_sigma_eps2)
 
         # Design
         G = make_G({"X_scaled": X}, terms, one_based=self.one_based, return_names=False)
@@ -202,7 +281,7 @@ class MOOGP:
                                     terms=terms, one_based=self.one_based)
             Cj_list.append(Cj)
 
-        Ky = build_Ky(Cj_list, Psi)
+        Ky = build_Ky(Cj_list, Psi, sigma_eps2=sigma_eps2)
         if self.jitter:
             Ky = Ky + self.jitter * np.eye(n * p)
 
@@ -231,6 +310,7 @@ class MOOGP:
             Ky_chol=Ky_chol,
             Cj_list=Cj_list,
             Psi=Psi,
+            sigma_eps2=sigma_eps2,
             G=G,
             Gy=Gy,
             bhat=bhat,
@@ -282,7 +362,15 @@ class MOOGP:
         self._nll(self.theta_hat)
         return self
     
-    def predict(self, Xstar, return_std=False, diag_only=True, include_mean_uncertainty=False):
+    def predict(
+        self,
+        Xstar,
+        *,
+        return_std=False,
+        diag_only=True,
+        include_mean_uncertainty=False,
+        predict_observation=True,
+    ):
         """
         Predict at new inputs Xstar (scaled in [-1,1]^d).
 
@@ -302,6 +390,7 @@ class MOOGP:
         X = cache["X"]
         Y = cache["Y"]
         Psi = cache["Psi"]
+        sigma_eps2 = cache.get("sigma_eps2", None)
         lat_params = cache["lat_params"]
         Gy = cache["Gy"]
         bhat = cache["bhat"]
@@ -343,6 +432,10 @@ class MOOGP:
         diag_prior = np.einsum("ii->i", K_XsXs)
         diag_cross = np.sum(K_XsX * V.T, axis=1)
         diag = diag_prior - diag_cross
+
+        # If predicting the observed output y(x)=f(x)+eps, add Sigma_eps ⊗ I_{n*}
+        if predict_observation and (sigma_eps2 is not None):
+            diag += np.tile(np.asarray(sigma_eps2, float).ravel(), nstar)
 
         if include_mean_uncertainty and Gs.size and use_reml and (A is not None):
             M = Gs_y - K_XsX @ cho_solve(Ky_chol, Gy, check_finite=False)

@@ -22,7 +22,7 @@ def forrester_true_functions(X):
 
 def fit_moogp_forrester(n_train=25, seed=0,q=3, learn_psi=False):
     # 1) Generate data
-    data = generate_forrester_data(n=n_train, seed=seed)
+    data = generate_forrester_data(n=n_train, seed=seed, with_error=True)
     X = data["X"]          # in [0,1]
     X_scaled = data["X_scaled"]  # in [-1,1]
     Y = data["y"]          # (n,3)
@@ -45,7 +45,7 @@ def fit_moogp_forrester(n_train=25, seed=0,q=3, learn_psi=False):
         Psi=Psi,
         learn_Psi=learn_psi,
         use_reml=False,
-        jitter=1e-6,
+        jitter=1e-2,
         one_based=True,
         normalize_rows=True,
     )
@@ -417,7 +417,7 @@ def evaluate_moogp(model, label="", n_test=200, seed=999):
 if __name__ == "__main__":
     # Example 1: full-rank (q=p, Psi=I) – should be very accurate
     model, X, X_scaled, Y = fit_moogp_forrester(
-        n_train=100,
+        n_train=25,
         seed=0,
         learn_psi=False,   # Psi = I_p
     )
@@ -432,9 +432,9 @@ if __name__ == "__main__":
 
     # Example 2: low-rank with learn_Psi=True – see how capacity changes
     model_lr, X_lr, X_scaled_lr, Y_lr = fit_moogp_forrester(
-        n_train=100,
+        n_train=25,
         seed=1,
-        q=3,
+        q=2,
         learn_psi=True,    # q=2 < p, Psi learned
     )
     fig4 = plot_forrester_fit(model_lr, X_lr, X_scaled_lr, Y_lr)
