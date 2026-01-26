@@ -66,8 +66,9 @@ def generate_borehole_data_nd(n,p=4, seed=67):
     return {"X_phys": theta, "X_scaled": theta_scaled, "Y": y, 'locations_phys': x}
         
 
-def generate_forrester_data(n, seed=67, with_error=False):
+def generate_forrester_data(n, seed=67, with_error=False, error_per_output=None):
     BOUNDS = np.array([[0,1]])
+    rng = np.random.default_rng(seed)
 
     def f_1(x):
         return ((6*x-2) ** 2) * np.sin(12*x-4)
@@ -91,10 +92,16 @@ def generate_forrester_data(n, seed=67, with_error=False):
     
     X = lhs_in_bounds(n, seed=seed)
     y = np.array([f_1(X) , f_2(X), f_3(X)]).squeeze().T
-    if with_error:
-        y += np.random.normal(0,2, size=y.shape) 
+    
+    f = y.copy()
+
+    if with_error and not error_per_output:
+        y += rng.normal(0,2, size=y.shape)
+        
+    if with_error and error_per_output:
+        y += rng.normal(0.0, np.sqrt(error_per_output), size=y.shape)
     X_scaled = to_m1_1(X)
-    out = {"X": X, "X_scaled": X_scaled, "y": y}
+    out = {"X": X, "X_scaled": X_scaled, "y": y, "f": f}
     return out
 
 def generate_borehold_data_1d(n, seed=67):

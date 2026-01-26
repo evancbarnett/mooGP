@@ -435,7 +435,7 @@ class MOOGP:
 
         # If predicting the observed output y(x)=f(x)+eps, add Sigma_eps ⊗ I_{n*}
         if predict_observation and (sigma_eps2 is not None):
-            diag += np.tile(np.asarray(sigma_eps2, float).ravel(), nstar)
+            diag += np.repeat(np.asarray(sigma_eps2, float).ravel(), nstar)
 
         if include_mean_uncertainty and Gs.size and use_reml and (A is not None):
             M = Gs_y - K_XsX @ cho_solve(Ky_chol, Gy, check_finite=False)
