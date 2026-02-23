@@ -1,3 +1,5 @@
+import time
+
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -6,10 +8,12 @@ from moogp.datasets import generate_forrester_data
 from moogp.model import MOOGP
 
 
+
+
 def forrester_true_functions(X):
     """
     X: (n,1) in [0,1]
-    Returns y_true: (n,3) matching your generate_forrester_data definition.
+    Returns y_true: (n,3) matching Forrester functions.
     """
     x = X.reshape(-1, 1)
 
@@ -20,9 +24,9 @@ def forrester_true_functions(X):
     return np.concatenate([f1, f2, f3], axis=1)
 
 
-def fit_moogp_forrester(n_train=25, seed=0,q=3, learn_psi=False):
+def fit_moogp_forrester(n_train=50, seed=0,q=3, Psi = None, use_fast=True, learn_Psi=False):
     # 1) Generate data
-    data = generate_forrester_data(n=n_train, seed=seed, with_error=True)
+    data = generate_forrester_data(n=n_train, seed=seed, with_error=True, error_per_output=[10, 1, 0.05])
     X = data["X"]          # in [0,1]
     X_scaled = data["X_scaled"]  # in [-1,1]
     Y = data["y"]          # (n,3)
@@ -33,23 +37,17 @@ def fit_moogp_forrester(n_train=25, seed=0,q=3, learn_psi=False):
     # 2) Mean basis: intercept + main effect
     terms = [None] + list(range(1, d + 1))
 
-    # 3) Latent dimension and Psi
-    if learn_psi:
-        Psi = None          # learned from theta
-    else:
-        Psi = np.eye(p)     # each latent → one output
-
     model = MOOGP(
         terms=terms,
         q=q,
         Psi=Psi,
-        learn_Psi=learn_psi,
-        use_reml=False,
-        jitter=1e-2,
-        one_based=True,
+        learn_Psi=learn_Psi,
+        learn_sigma_eps=True,
+        jitter=1e-6,
         normalize_cols=True,
+        use_diagonalized_interaction=use_fast  # Fast computation
     )
-
+    # TODO Decide whether to have default bounds inside MOOGP class
     # 4) Build theta0 and bounds
     theta0 = []
     bounds = []
@@ -64,21 +62,24 @@ def fit_moogp_forrester(n_train=25, seed=0,q=3, learn_psi=False):
 
     theta0 = np.array(theta0)
 
-    if learn_psi:
-        # add free Psi params at the end
-        rng = np.random.default_rng(0)
-        Psi0_free = rng.standard_normal((p, q))
-        theta0 = np.concatenate([theta0, Psi0_free.ravel()])
+    # include parameters for Sigma eps
+    y_var = Y.var(axis=0, ddof=1)  
+    sigma_eps2_init = np.log(1e-2 * y_var)
+    theta0 = np.concatenate([theta0, sigma_eps2_init])
 
-        # bounds for Psi entries
-        bounds.extend([(-5.0, 5.0)] * (p * q))
+    # Bounds for Sigma eps 
+    lb = np.maximum(1e-12, 1e-6 * y_var)
+    ub = np.maximum(lb * 10.0, 0.5 * y_var) 
+
+    log_bounds = [(float(np.log(lbi)), float(np.log(ubi))) for lbi, ubi in zip(lb, ub)]
+    bounds.extend(log_bounds)
 
     # 5) Fit
     model.fit(
         data={"X_scaled": X_scaled, "y": Y},
         theta0=theta0,
         bounds=bounds,
-        optimizer_opts={"maxiter": 100},
+        optimizer_opts={"maxiter": 500},
     )
 
     return model, X, X_scaled, Y
@@ -296,9 +297,7 @@ def evaluate_moogp(model, label="", n_test=200, seed=999):
     """
     print(f"\n=== Evaluation: {label} ===")
 
-    # -----------------------
     # Helpers
-    # -----------------------
     def rmse(y_hat, y):
         return np.sqrt(np.mean((y_hat - y) ** 2, axis=0))
 
@@ -306,9 +305,7 @@ def evaluate_moogp(model, label="", n_test=200, seed=999):
         denom = np.maximum(np.abs(y), 1e-8)
         return np.sqrt(np.mean(((y_hat - y) / denom) ** 2, axis=0)) * 100.0
 
-    # -----------------------
-    # Train data & MOOGP preds
-    # -----------------------
+    # Generate data
     train_data = model._data  # set inside model.fit via _prepare_data
     X_train_scaled = train_data["X_scaled"]
     Y_train = train_data["y"]
@@ -415,33 +412,22 @@ def evaluate_moogp(model, label="", n_test=200, seed=999):
 
 
 if __name__ == "__main__":
-    # Example 1: full-rank (q=p, Psi=I) – should be very accurate
+    # Example 1
+    start_time = time.perf_counter()
+
     model, X, X_scaled, Y = fit_moogp_forrester(
-        n_train=25,
+        n_train=100,
         seed=0,
-        learn_psi=False,   # Psi = I_p
+        q=3 
     )
     fig1 = plot_forrester_fit(model, X, X_scaled, Y)
     fig2 = plot_pred_vs_true(model)
     fig3 = plot_trend_vs_ls(
         model, X, X_scaled, Y,
-        title_suffix=" (Psi = Identity)"
     )
+    end_time = time.perf_counter()
+    elapsed_time = end_time - start_time
+    print(f"Fit and predict in {elapsed_time:.4f} seconds")
+    
     evaluate_moogp(model, label="Full-rank (q=p, Psi=I)")
-    plt.show()
-
-    # Example 2: low-rank with learn_Psi=True – see how capacity changes
-    model_lr, X_lr, X_scaled_lr, Y_lr = fit_moogp_forrester(
-        n_train=25,
-        seed=1,
-        q=2,
-        learn_psi=True,    # q=2 < p, Psi learned
-    )
-    fig4 = plot_forrester_fit(model_lr, X_lr, X_scaled_lr, Y_lr)
-    fig5 = plot_pred_vs_true(model_lr)
-    fig6 = plot_trend_vs_ls(
-        model_lr, X_lr, X_scaled_lr, Y_lr,
-        title_suffix=" (Psi Learned)"
-    )
-    evaluate_moogp(model_lr, label="Psi Learned")
     plt.show()

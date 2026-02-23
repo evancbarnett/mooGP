@@ -181,3 +181,32 @@ def make_c_star_matrix(X, Xp, ell, sigma2, terms, one_based=True):
 
     C_corr = (hX * Hinvd) @ hXp.T
     return C - C_corr
+
+def make_c_star_diag(X, ell, sigma2, terms, one_based=True):
+    """Compute ONLY the diagonal of the orthogonalized kernel matrix ``C*(X, X)``.
+
+    This avoids computing the full (n, n) matrix when only the variance
+    is needed, dropping memory complexity from O(n^2) to O(n).
+    """
+    X = np.asarray(X)
+    n, d = X.shape
+
+    J_sets = parse_terms_to_index_sets(terms, d, one_based=one_based)
+
+    # 1. Base covariance diagonal (For SE, it is just sigma2 everywhere)
+    C_diag = np.full(n, sigma2)
+    if len(J_sets) == 0:
+        return C_diag
+
+    # 2. Compute h(X) -> shape (n, r)
+    hX = h_matrix_se(X, ell, sigma2, terms, one_based=one_based)
+
+    # 3. Compute H diagonal and H^{-1} -> shape (r,)
+    Hdiag = H_diag_se(ell, sigma2, terms, one_based=one_based)
+    Hinvd = 1.0 / Hdiag
+
+    # 4. Compute the diagonal of the correction term: diag(hX @ Hinvd @ hX.T)
+    # We do this quickly by squaring hX, multiplying by Hinvd, and summing across the rows
+    C_corr_diag = np.sum((hX ** 2) * Hinvd, axis=1)
+
+    return C_diag - C_corr_diag

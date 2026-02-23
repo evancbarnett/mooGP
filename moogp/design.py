@@ -72,45 +72,29 @@ def make_G(data, terms, one_based=True, return_names=False):
     n, d = X.shape
 
     # Validate `terms` early (also ensures consistent parsing w.r.t. kernels.py)
-    _ = parse_terms_to_index_sets(terms, d, one_based=one_based)
+    J_sets = parse_terms_to_index_sets(terms, d, one_based=one_based)
     
     cols = []
     names = []
 
-    def add_col(name, col):
-            cols.append(col.reshape(n, 1))
-            names.append(name)
-
-    for t in terms:
-        # None -> Intercept
-        if t is None:
-            add_col('1', np.ones(n))
-            continue
-
-        # int -> Single Effect
-        if isinstance(t, (int, np.integer)):
-            j = t - 1 if one_based else t
-            if j < 0 or j >= d:
-                raise ValueError(f"Index {t} out of range for d={d} (one_based={one_based}).")
-            add_col(f'x{j+1}', X[:, j])
-            continue
-
-        # (int, int) -> Interaction
+    for idxs in J_sets:
+        if len(idxs) == 0:
+            # Intercept
+            cols.append(np.ones((n, 1)))
+            names.append('1')
+            
+        elif len(idxs) == 1:
+            # Single Effect
+            j = idxs[0]
+            cols.append(X[:, j].reshape(n, 1))
+            names.append(f'x{j + 1}' if one_based else f'x{j}')
+            
         else:
-            try:
-                idxs = [(i - 1) if one_based else int(i) for i in t]
-            except Exception as e:
-                raise ValueError(f"Unrecognized term: {t}") from e
-
-        if len(idxs) < 2:
-            raise ValueError(f"Interactions must have length >= 2; got {t}")
-        if any((i < 0 or i >= d) for i in idxs):
-            raise ValueError(f"Some indices in {t} are out of range for d={d}.")
-
-
-        prod = np.prod(X[:, idxs], axis=1)
-        name = '*'.join([f'x{i+1}' for i in idxs])
-        add_col(name, prod)
+            # Interaction
+            prod = np.prod(X[:, idxs], axis=1).reshape(n, 1)
+            name = '*'.join([f'x{i+1}' if one_based else f'x{i}' for i in idxs])
+            cols.append(prod)
+            names.append(name)
 
     G = np.hstack(cols) if cols else np.empty((n, 0))
     return (G, names) if return_names else G
