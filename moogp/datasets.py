@@ -66,43 +66,41 @@ def generate_borehole_data_nd(n,p=4, seed=67):
     return {"X_phys": theta, "X_scaled": theta_scaled, "Y": y, 'locations_phys': x}
         
 
-def generate_forrester_data(n, seed=67, with_error=False, error_per_output=None):
+def generate_forrester_data(n, seed=67, with_error=False, error_per_output=None, X_override=None):
     BOUNDS = np.array([[0,1]])
     rng = np.random.default_rng(seed)
 
     def f_1(x):
         return ((6*x-2) ** 2) * np.sin(12*x-4)
-    
     def f_2(x):
         return 0.5 * f_1(x) + 5 * (x - 0.5) + 5
-    
     def f_3(x):
         return -0.8 * f_1(x) - 5 * (x - 0.5) - 4
-    
+
     def lhs_in_bounds(n, bounds=BOUNDS, seed=seed):
         d = bounds.shape[0]
         sampler = qmc.LatinHypercube(d=d, scramble=True, seed=seed)
-        U = sampler.random(n)                                  # in [0,1]^d
-        return qmc.scale(U, bounds[:, 0], bounds[:, 1]) 
-    
+        U = sampler.random(n)
+        return qmc.scale(U, bounds[:, 0], bounds[:, 1])
+
     def to_m1_1(X, bounds=BOUNDS):
         a, b = bounds[:, 0], bounds[:, 1]
         return 2.0 * (X - a) / (b - a) - 1.0
 
-    
-    X = lhs_in_bounds(n, seed=seed)
-    y = np.array([f_1(X) , f_2(X), f_3(X)]).squeeze().T
-    
+    # allow X override
+    X = lhs_in_bounds(n, seed=seed) if X_override is None else np.asarray(X_override).reshape(-1, 1)
+
+    y = np.array([f_1(X), f_2(X), f_3(X)]).squeeze().T
     f = y.copy()
 
     if with_error and not error_per_output:
-        y += rng.normal(0,2, size=y.shape)
-        
+        y += rng.normal(0, 2, size=y.shape)
+
     if with_error and error_per_output:
         y += rng.normal(0.0, np.sqrt(error_per_output), size=y.shape)
+
     X_scaled = to_m1_1(X)
-    out = {"X": X, "X_scaled": X_scaled, "y": y, "f": f}
-    return out
+    return {"X": X, "X_scaled": X_scaled, "y": y, "f": f}
 
 def generate_borehold_data_1d(n, seed=67):
     # Borehole function: 8 x_j variables
@@ -154,3 +152,44 @@ def borehole_vec_physical(x, theta):
     denom2 = Treff
     return ((numer/(denom1 + denom2)) * np.exp(powparam * rw)).reshape(-1)
 
+
+def log_lhs_1d_rescaled(n, seed, xmin=1e-3, cluster="right", include_x0=False, shuffle=False):
+    """
+    Log-LHS then rescale to [0,1].
+    cluster="right": concentrates near x≈1 (missing early x)
+    cluster="left":  concentrates near x≈0 (missing late x)
+
+    include_x0=True: replaces one sample with exactly x=0 to improve left-edge coverage.
+    shuffle=True: randomize point order (optional).
+    """
+    rng = np.random.default_rng(seed)
+
+    n_gen = n - 1 if include_x0 else n
+
+    # LHS on [0,1] for n_gen points
+    u = rng.random(n_gen)
+    perm = rng.permutation(n_gen)
+    t = (perm + u) / n_gen  # stratified in [0,1]
+
+    # log-uniform r in [xmin, 1]
+    r = np.exp(np.log(xmin) + t * (0.0 - np.log(xmin)))  # many near xmin
+
+    if cluster == "left":
+        x_raw = r
+        x = (x_raw - xmin) / (1.0 - xmin)
+    elif cluster == "right":
+        x_raw = 1.0 - r
+        x = x_raw / (1.0 - xmin)
+    else:
+        raise ValueError("cluster must be 'left' or 'right'")
+
+    x = x.reshape(-1, 1)
+
+    if include_x0:
+        x = np.vstack([x, np.array([[0.0]])])
+
+    if shuffle:
+        idx = rng.permutation(x.shape[0])
+        x = x[idx]
+
+    return x
