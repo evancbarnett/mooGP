@@ -1,11 +1,12 @@
-import numpy as np
+import autograd.numpy as np
+
 from numpy.linalg import LinAlgError, norm
 from scipy.linalg import cho_factor, cho_solve, solve, solve_triangular
 from scipy.optimize import minimize
 
 from .design import make_G, build_Gy, vecF, unvecF
 from .kernels import make_c_star_matrix, make_c_star_diag
-
+from autograd import value_and_grad
 
 def unpack_theta(
     theta_raw,
@@ -35,7 +36,7 @@ def unpack_theta(
 
     """
      # flatten array to 1d
-    t = np.asarray(theta_raw).ravel()
+    t = theta_raw
     base = q * (d + 1)  # number of latent-kernel hyperparameters
     if t.size < base:
         raise ValueError(f"theta length {t.size} < required latent {base}")
@@ -48,7 +49,7 @@ def unpack_theta(
         off += 1
         log_ell = lat[off:off+d]
         off += d
-        lat_params.append((float(np.exp(log_s2)), np.exp(log_ell)))
+        lat_params.append((np.exp(log_s2), np.exp(log_ell)))
     off = base
 
     Psi = None
@@ -61,9 +62,9 @@ def unpack_theta(
 
         Psi = Psi_free.copy()
         if normalize_cols:
-            for j in range(q):
-                nrm = norm(Psi[:, j]) or 1.0 # prevent divide by zero 
-                Psi[:, j] /= nrm
+            nrms = np.linalg.norm(Psi, axis=0)
+            nrms = np.where(nrms == 0, 1.0, nrms) # prevent divide by zero
+            Psi = Psi / nrms
 
     sigma_eps2 = None
     if learn_sigma_eps:
@@ -72,7 +73,7 @@ def unpack_theta(
             raise ValueError(f"theta length {t.size} < required +Sigma_eps {off+need}")
         log_sigma = t[off:off + need]
         off += need
-        sigma_eps2 = np.exp(log_sigma).astype(float)
+        sigma_eps2 = np.exp(log_sigma)
 
     return lat_params, Psi, sigma_eps2
 
@@ -137,6 +138,7 @@ class MOOGP:
                  q,
                  Psi=None,
                  *,
+                 orthogonal=True,
                  learn_Psi=False,
                  sigma_eps2=None,
                  learn_sigma_eps=None,
@@ -158,6 +160,9 @@ class MOOGP:
         Psi : (p, q) array or None # TODO Change Psi arg options
             Initial / fixed mixing matrix. If learn_Psi=False, this must be provided.
             If learn_Psi=True, it's used for shape.
+        orthogonal : bool
+            If true, use orthogonalized squared exponential kernel detailed in 
+            #TODO put paper link. If false, use standard squared exponential kernel.
         learn_Psi : bool
             If True, theta also parameterizes Psi.
         sigma_eps2: (p,) array or None
@@ -189,6 +194,7 @@ class MOOGP:
         self.terms = terms
         self.q = q
         self.Psi = None if Psi is None else np.asarray(Psi, float)
+        self.orthogonal = orthogonal
         self.learn_Psi = learn_Psi
         self.sigma_eps2 = None if sigma_eps2 is None else np.asarray(sigma_eps2, float).ravel()
         
@@ -248,7 +254,7 @@ class MOOGP:
 
     def _apply_Ky_inv_fast(self, rhs, info):
         """Apply the diagonalized Woodbury form for ``K_y^{-1}`` to ``rhs``."""
-        rhs = np.asarray(rhs, float)
+
         was_vec = (rhs.ndim == 1)
         rhs2 = rhs[:, None] if was_vec else rhs
 
@@ -282,7 +288,7 @@ class MOOGP:
             Qk_M_uk = Qk @ M_uk
             
             # Step C: Project back to the output space and subtract -> shape (n, p, m)
-            out -= Qk_M_uk[:, None, :] * uk[None, :, None]
+            out = out - (Qk_M_uk[:, None, :] * uk[None, :, None])
 
         # Re-vectorize back to (np, m)
         out2 = out.reshape(n * p, rhs2.shape[1], order="F")
@@ -332,18 +338,18 @@ class MOOGP:
 
         if sigma_eps2 is None:
             sigma_eps2 = np.zeros(p, dtype=float)
-        sigma_eps2 = np.maximum(np.asarray(sigma_eps2, float).ravel(), self.min_sigma_eps2)
+        sigma_eps2 = np.maximum(sigma_eps2, self.min_sigma_eps2)
 
         # Design
         G = self.G
         r = self.r
         Gy = self.Gy
 
-        # Covariance per latent: Cj_list[k] corresponds to manuscript C_k^*.
+        # Covariance per latent: Cj_list[k]
         Cj_list = []
         for (sigma2_j, ell_j) in lat_params:
             Cj = make_c_star_matrix(X, X, ell=ell_j, sigma2=sigma2_j,
-                                    terms=terms, one_based=self.one_based)
+                                    terms=terms, orthogonal=self.orthogonal, one_based=self.one_based)
             Cj_list.append(Cj)
 
         fast_diag_info = None
@@ -366,17 +372,13 @@ class MOOGP:
                 Ck_star = Cj_list[k]
                 Dk = d_vals[k]
 
-                # Eigendecomp of C_k*
-                Wk, Uk = np.linalg.eigh(Ck_star)
+                A = np.eye(n) + Dk * Ck_star + 1e-8 * np.eye(n)   # small stabilizing jitter
+                L = np.linalg.cholesky(A)
+                logdetK += 2.0 * np.sum(np.log(np.diag(L)))
 
-                Wk = np.maximum(Wk, 1e-10)
-
-                # sum(log|I_n + d_k C_k*|) - sum of log eigenvalues equals log det
-                logdetK += np.sum(np.log(1.0 + Dk * Wk))
-
-                # Qk = (d_k I_n + (C_k*)^-1)^-1
-                inner_diag = 1.0 / (Dk + 1.0 / Wk)
-                Qk = (Uk * inner_diag) @ Uk.T
+                # Qk = Ck_star @ inv(A)  (more stable as a solve)
+                Qk = np.linalg.solve(A, Ck_star)   # equals inv(A) @ Ck_star, same eigenspace
+                Qk = 0.5 * (Qk + Qk.T)             # optional symmetrize
                 Q_list.append(Qk)
 
             fast_diag_info = dict(
@@ -404,7 +406,7 @@ class MOOGP:
 
             A_gls = Gy.T @ z
             b_gls = Gy.T @ alpha
-            beta_vec = solve(A_gls, b_gls, assume_a="sym")
+            beta_vec = np.linalg.solve(A_gls, b_gls)
 
             bhat = unvecF(beta_vec, r, p)
             rvec = vecY - Gy @ vecF(bhat)
@@ -414,7 +416,7 @@ class MOOGP:
             rvec = vecY
             Ky_inv_rvec = solve_Ky(rvec)
     
-        qf = float(rvec @ Ky_inv_rvec)
+        qf = np.dot(rvec, Ky_inv_rvec)
         nll = 0.5 * (logdetK + qf + (n * p) * np.log(2.0 * np.pi))
 
         if self.use_reml:
@@ -467,10 +469,21 @@ class MOOGP:
 
         obj = lambda th: self._nll(th)
 
+        use_fast = self.use_diagonalized_interaction and (not self.use_slow_kyinv)
+
+        if use_fast:
+            target_obj = value_and_grad(obj)
+            use_jac = True
+        else:
+            target_obj = obj
+            use_jac = False
+        
+
         res = minimize(
-            obj,
+            target_obj,
             np.asarray(theta0),
             method="L-BFGS-B",
+            jac=use_jac,
             bounds=bounds,
             options={"maxiter": 200, **(optimizer_opts or {})} if optimizer_opts else {"maxiter": 200},
         )
@@ -528,7 +541,7 @@ class MOOGP:
         Cj_XsX = []
         for (sigma2_j, ell_j) in lat_params:
             Cj1 = make_c_star_matrix(Xs, X, ell=ell_j, sigma2=sigma2_j,
-                                     terms=terms, one_based=one_based)
+                                     terms=terms, orthogonal=self.orthogonal, one_based=one_based)
             Cj_XsX.append(Cj1)
 
         # 2. FAST MEAN PREDICTION (Zero Kronecker Products)
@@ -561,7 +574,7 @@ class MOOGP:
         for j, (sigma2_j, ell_j) in enumerate(lat_params):
             # Compute only diagonal of test-test matrix
             Cj2_diag = make_c_star_diag(Xs, ell=ell_j, sigma2=sigma2_j,
-                                        terms=terms, one_based=one_based)
+                                        terms=terms, orthogonal=self.orthogonal, one_based=one_based)
             # The diagonal of A kron B is kron(diag(A), diag(B))
             diag_prior += np.kron(Psi[:, j]**2, Cj2_diag)
 

@@ -1,6 +1,6 @@
-import numpy as np
-from numpy import sqrt, pi, exp
-from scipy.special import erf
+import autograd.numpy as np
+from autograd.numpy import sqrt, pi, exp
+from autograd.scipy.special import erf
 
 from .design import parse_terms_to_index_sets
 
@@ -42,7 +42,7 @@ def se_kernel_matrix(X, Xp, ell, sigma2=1.0):
     """
     X = np.asarray(X)
     Xp = np.asarray(Xp)
-    ell = np.asarray(ell)
+    
     dif = (X[:, None, :] - Xp[None, :, :]) / ell  # (n, m, d)
     D2 = np.sum(dif * dif, axis=2)
     return sigma2 * np.exp(-D2)
@@ -77,7 +77,7 @@ def h_matrix_se(X, ell, sigma2, terms, one_based=True):
     """
     X = np.asarray(X)
     n, d = X.shape
-    ell = np.asarray(ell)
+    
 
     J_sets = parse_terms_to_index_sets(terms, d, one_based=one_based)
     r = len(J_sets)
@@ -85,13 +85,10 @@ def h_matrix_se(X, ell, sigma2, terms, one_based=True):
         return np.empty((n, 0), float)
 
     # Precompute M_j and L_j for all coords (shape: n×d)
-    M_all = np.empty((n, d))
-    L_all = np.empty((n, d))
-    for j in range(d):
-        M_all[:, j] = M_gauss(X[:, j], ell[j], sigma2=1.0)
-        L_all[:, j] = L_gauss(X[:, j], ell[j], sigma2=1.0)
+    M_all = np.column_stack([M_gauss(X[:, j], ell[j], sigma2=1.0) for j in range(d)])
+    L_all = np.column_stack([L_gauss(X[:, j], ell[j], sigma2=1.0) for j in range(d)])
 
-    Hcols = np.empty((n, r))
+    Hcols_list = []
     all_idx = set(range(d))
     for i, Ji in enumerate(J_sets):
         Ji = set(Ji)
@@ -99,10 +96,12 @@ def h_matrix_se(X, ell, sigma2, terms, one_based=True):
         Ji = list(Ji)
         col = np.ones(n)
         if notJ:
-            col *= np.prod(M_all[:, notJ], axis=1)
+            col = col * np.prod(M_all[:, notJ], axis=1)
         if Ji:
-            col *= np.prod(L_all[:, Ji], axis=1)
-        Hcols[:, i] = col
+            col = col * np.prod(L_all[:, Ji], axis=1)
+        Hcols_list.append(col)
+
+    Hcols = np.column_stack(Hcols_list)
 
     # sigma2 scales the kernel, so it scales both h and H
     return Hcols * sigma2
@@ -120,15 +119,15 @@ def H_diag_se(ell, sigma2, terms, one_based=True):
     ndarray
         Shape ``(r,)``.
     """
-    ell = np.asarray(ell)
+    
     d = len(ell)
     J_sets = parse_terms_to_index_sets(terms, d, one_based=one_based)
     r = len(J_sets)
     if r == 0:
         return np.empty((0,), float)
 
-    IM = np.array([IM_gauss(ell[j], sigma2=1.0) for j in range(d)])
-    ILL = np.array([ILL_gauss(ell[j], sigma2=1.0) for j in range(d)])
+    IM = np.stack([IM_gauss(ell[j], sigma2=1.0) for j in range(d)])
+    ILL = np.stack([ILL_gauss(ell[j], sigma2=1.0) for j in range(d)])
 
     Hdiag = []
     all_idx = set(range(d))
@@ -143,13 +142,13 @@ def H_diag_se(ell, sigma2, terms, one_based=True):
             val *= np.prod(ILL[Ji])
         Hdiag.append(val)
 
-    Hdiag = np.asarray(Hdiag)
+    Hdiag = np.stack(Hdiag)
     if np.any(Hdiag <= 0):
         raise RuntimeError("Non-positive H diagonal (check ell/domain).")
     return Hdiag * sigma2
 
 
-def make_c_star_matrix(X, Xp, ell, sigma2, terms, one_based=True):
+def make_c_star_matrix(X, Xp, ell, sigma2, terms, orthogonal=True,one_based=True):
     """Compute the orthogonalized kernel matrix ``C*(X, X')``.
 
     This is the matrix version of
@@ -168,7 +167,7 @@ def make_c_star_matrix(X, Xp, ell, sigma2, terms, one_based=True):
 
     # Base covariance
     C = se_kernel_matrix(X, Xp, ell, sigma2=sigma2)
-    if len(J_sets) == 0:
+    if (len(J_sets) == 0) or (not orthogonal):
         return C
 
     # h(X), h(X')
@@ -182,7 +181,7 @@ def make_c_star_matrix(X, Xp, ell, sigma2, terms, one_based=True):
     C_corr = (hX * Hinvd) @ hXp.T
     return C - C_corr
 
-def make_c_star_diag(X, ell, sigma2, terms, one_based=True):
+def make_c_star_diag(X, ell, sigma2, terms, orthogonal=True ,one_based=True):
     """Compute ONLY the diagonal of the orthogonalized kernel matrix ``C*(X, X)``.
 
     This avoids computing the full (n, n) matrix when only the variance
@@ -195,7 +194,7 @@ def make_c_star_diag(X, ell, sigma2, terms, one_based=True):
 
     # 1. Base covariance diagonal (For SE, it is just sigma2 everywhere)
     C_diag = np.full(n, sigma2)
-    if len(J_sets) == 0:
+    if (len(J_sets) == 0) or (not orthogonal):
         return C_diag
 
     # 2. Compute h(X) -> shape (n, r)
