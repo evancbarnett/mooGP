@@ -9,6 +9,49 @@ from moogp.model import MOOGP
 from moogp.evaluation import *
 from pathlib import Path
 
+def get_model_trend_betas_raw(model):
+    """
+    Convert cached bhat from scaled basis
+        m(x_scaled) = b0 + b1 * x_scaled
+    to raw-x basis
+        m(x) = beta0 + beta1 * x,  x in [0,1],
+    where x_scaled = 2x - 1.
+    """
+    Bhat = np.asarray(model.cache["bhat"], dtype=float)
+
+    if Bhat.shape[0] != 2:
+        raise ValueError("Expected a 1D linear trend with terms=[None, 1].")
+
+    b0_scaled = Bhat[0, :]
+    b1_scaled = Bhat[1, :]
+
+    beta0_raw = b0_scaled - b1_scaled
+    beta1_raw = 2.0 * b1_scaled
+
+    return np.vstack([beta0_raw, beta1_raw])  # shape (2, p)
+
+
+def get_ols_betas_raw(X_raw, Y):
+    """
+    OLS fit in the raw-x basis: y = beta0 + beta1 x.
+    Returns shape (2, p).
+    """
+    G = np.column_stack([np.ones(X_raw.shape[0]), X_raw[:, 0]])
+    B_ls, *_ = np.linalg.lstsq(G, Y, rcond=None)
+    return B_ls
+
+def eval_linear_trend(X_raw, betas_raw, output_idx):
+    """
+    Evaluate beta0 + beta1 x for one selected output.
+    """
+    x = X_raw[:, 0]
+    return betas_raw[0, output_idx] + betas_raw[1, output_idx] * x
+
+
+def rmspe_1d(y_true, y_pred):
+    y_true = np.asarray(y_true).ravel()
+    y_pred = np.asarray(y_pred).ravel()
+    return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
 
 def forrester_true_functions(X):
     """
@@ -112,14 +155,19 @@ def plot_forrester_fit(model, X, X_scaled, Y, n_plot=400, non_ortho_model=None):
     import numpy as np
 
     paper_rc = {
+        # Fonts 
         "font.family": "serif",
-        "font.size": 10,
-        "axes.labelsize": 10,
-        "legend.fontsize": 9,
-        "xtick.labelsize": 9,
-        "ytick.labelsize": 9,
+        "font.size": 12,
+        "axes.labelsize": 12,
+        "legend.fontsize": 11,
+        "xtick.labelsize": 11,
+        "ytick.labelsize": 11,
+
+        # Lines / markers
         "lines.linewidth": 1.6,
         "lines.markersize": 4,
+
+        # Axes aesthetics
         "axes.spines.top": False,
         "axes.spines.right": False,
         "axes.grid": False,
@@ -131,6 +179,8 @@ def plot_forrester_fit(model, X, X_scaled, Y, n_plot=400, non_ortho_model=None):
         "ytick.minor.size": 2.5,
         "xtick.minor.visible": True,
         "ytick.minor.visible": True,
+
+        # Savefig defaults
         "savefig.dpi": 300,
     }
 
@@ -156,16 +206,14 @@ def plot_forrester_fit(model, X, X_scaled, Y, n_plot=400, non_ortho_model=None):
         if p == 1:
             axes = [axes]
 
-        # Legend on Output 3 if it exists; otherwise on last axis.
         legend_ax_idx = min(2, p - 1)
 
-        # Model styling (color + linestyle). Keep linestyle difference for B/W safety.
         moogp_style = dict(color="tab:blue", linestyle="--")
         mogp_style  = dict(color="tab:orange", linestyle=":")
 
         def plot_mean_and_interval_lines(
             ax, x, mean, std, *,
-            label_mean=None,
+            label_line=None,
             color="tab:blue",
             linestyle="-",
             lw_mean=1.9,
@@ -175,7 +223,6 @@ def plot_forrester_fit(model, X, X_scaled, Y, n_plot=400, non_ortho_model=None):
             upper = mean + 2.0 * std
             lower = mean - 2.0 * std
 
-            # Fill (no label)
             ax.fill_between(
                 x, lower, upper,
                 color=color,
@@ -184,17 +231,14 @@ def plot_forrester_fit(model, X, X_scaled, Y, n_plot=400, non_ortho_model=None):
                 zorder=1
             )
 
-            # Boundary lines (no labels; same formatting as mean)
             ax.plot(x, upper, color=color, linestyle=linestyle, linewidth=lw_bound, zorder=3)
             ax.plot(x, lower, color=color, linestyle=linestyle, linewidth=lw_bound, zorder=3)
 
-            # Mean line (label only on legend axis)
-            ax.plot(x, mean, color=color, linestyle=linestyle, linewidth=lw_mean, label=label_mean, zorder=4)
+            ax.plot(x, mean, color=color, linestyle=linestyle, linewidth=lw_mean, label=label_line, zorder=4)
 
         for j, ax in enumerate(axes):
             add_labels = (j == legend_ax_idx)
 
-            # Training data
             ax.scatter(
                 X[:, 0], Y[:, j],
                 s=18,
@@ -205,7 +249,6 @@ def plot_forrester_fit(model, X, X_scaled, Y, n_plot=400, non_ortho_model=None):
                 zorder=5
             )
 
-            # True function: solid black (requested)
             ax.plot(
                 X_plot[:, 0], Y_true_plot[:, j],
                 linestyle="-",
@@ -215,13 +258,13 @@ def plot_forrester_fit(model, X, X_scaled, Y, n_plot=400, non_ortho_model=None):
                 zorder=2
             )
 
-            # MOOGP
+            # MOOGP (label without "mean")
             plot_mean_and_interval_lines(
                 ax,
                 X_plot[:, 0],
                 mean_moogp[:, j],
                 std_moogp[:, j],
-                label_mean="MOOGP mean" if add_labels else None,
+                label_line="MOOGP" if add_labels else None,
                 color=moogp_style["color"],
                 linestyle=moogp_style["linestyle"],
                 lw_mean=1.9,
@@ -229,14 +272,14 @@ def plot_forrester_fit(model, X, X_scaled, Y, n_plot=400, non_ortho_model=None):
                 alpha_fill=0.12
             )
 
-            # MOGP (non-ortho)
+            # MOGP (label without "mean")
             if non_ortho_model is not None:
                 plot_mean_and_interval_lines(
                     ax,
                     X_plot[:, 0],
                     mean_mogp[:, j],
                     std_mogp[:, j],
-                    label_mean="MOGP mean" if add_labels else None,
+                    label_line="MOGP" if add_labels else None,
                     color=mogp_style["color"],
                     linestyle=mogp_style["linestyle"],
                     lw_mean=1.9,
@@ -249,20 +292,195 @@ def plot_forrester_fit(model, X, X_scaled, Y, n_plot=400, non_ortho_model=None):
 
         axes[-1].set_xlabel("x")
 
-        # Legend bottom-left of Output 3 panel; de-duplicate.
+        # Legend bottom-left of Output 3 panel; boxed.
         leg_ax = axes[legend_ax_idx]
         handles, labels = leg_ax.get_legend_handles_labels()
         seen = set()
         uniq = [(h, l) for h, l in zip(handles, labels) if l and (l not in seen and not seen.add(l))]
         if uniq:
-            leg_ax.legend(
+            leg = leg_ax.legend(
                 [h for h, _ in uniq],
                 [l for _, l in uniq],
                 loc="lower left",
-                frameon=False,
+                frameon=True,          # <-- box ON
+                fancybox=False,        # crisp rectangle (journal-y)
+                framealpha=1.0,
                 handlelength=2.8,
                 borderaxespad=0.6
             )
+            # Make the box look clean in print
+            leg.get_frame().set_edgecolor("black")
+            leg.get_frame().set_linewidth(0.8)
+
+        return fig
+
+def plot_forrester_fit_side_by_side(
+    moogp_lhs, X_lhs, Y_lhs, mogp_lhs=None,
+    moogp_log=None, X_log=None, Y_log=None, mogp_log=None,
+    n_plot=400,
+    left_label="LHS",
+    right_label="log-LHS",
+):
+    import matplotlib as mpl
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    # Match your latest styling choices (bigger fonts + boxed legend)
+    scale_factor = 1.5
+    paper_rc = {
+        "font.family": "serif",
+        "font.size": 12 * scale_factor,
+        "axes.labelsize": 12 * scale_factor,
+        "legend.fontsize": 11 * scale_factor,
+        "xtick.labelsize": 11 * scale_factor,
+        "ytick.labelsize": 11 * scale_factor,
+        "lines.linewidth": 1.6,
+        "lines.markersize": 4,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "axes.grid": False,
+        "xtick.direction": "in",
+        "ytick.direction": "in",
+        "xtick.major.size": 4,
+        "ytick.major.size": 4,
+        "savefig.dpi": 300,
+    }
+
+    with mpl.rc_context(paper_rc):
+        # Dense grid
+        X_plot = np.linspace(0.0, 1.0, n_plot).reshape(-1, 1)
+        X_plot_scaled = 2.0 * (X_plot - 0.5)
+        Y_true_plot = forrester_true_functions(X_plot)
+
+        # Colors/linestyles
+        moogp_style = dict(color="tab:blue", linestyle="--")
+        mogp_style  = dict(color="tab:orange", linestyle=":")
+
+        def plot_mean_and_interval_lines(ax, x, mean, std, *, label_line=None, color="tab:blue",
+                                         linestyle="-", lw_mean=1.9, lw_bound=1.3, alpha_fill=0.12):
+            upper = mean + 2.0 * std
+            lower = mean - 2.0 * std
+
+            # Fill (no legend)
+            ax.fill_between(x, lower, upper, color=color, alpha=alpha_fill, linewidth=0.0, zorder=1)
+            # Boundary lines (same formatting as trend; no legend)
+            ax.plot(x, upper, color=color, linestyle=linestyle, linewidth=lw_bound, zorder=3)
+            ax.plot(x, lower, color=color, linestyle=linestyle, linewidth=lw_bound, zorder=3)
+            # Trend line (legend label here only)
+            ax.plot(x, mean,  color=color, linestyle=linestyle, linewidth=lw_mean, label=label_line, zorder=4)
+
+        def draw_panel(ax, X, Y, moogp, mogp, add_legend_labels):
+            # training points
+            ax.scatter(X[:, 0], Y[:, 0]*0 + Y[:, 0], s=18, color="black", alpha=0.75,
+                       linewidths=0.0, label="Training data" if add_legend_labels else None, zorder=5)
+
+        # Create axes: rows = outputs, cols = designs
+        p = Y_lhs.shape[1]
+        fig, axes = plt.subplots(
+            p, 2,
+            figsize=(13.2, 1.9 * p),  # ~double width of your single-column figure
+            sharex=True,
+            constrained_layout=True,
+        )
+        if p == 1:
+            axes = np.array([[axes[0], axes[1]]])
+
+        # Precompute predictions for both designs/models
+        mean_lhs_moogp, std_lhs_moogp = moogp_lhs.predict(X_plot_scaled, return_std=True)
+        mean_lhs_mogp = std_lhs_mogp = None
+        if mogp_lhs is not None:
+            mean_lhs_mogp, std_lhs_mogp = mogp_lhs.predict(X_plot_scaled, return_std=True)
+
+        mean_log_moogp = std_log_moogp = None
+        mean_log_mogp = std_log_mogp = None
+        if moogp_log is not None:
+            mean_log_moogp, std_log_moogp = moogp_log.predict(X_plot_scaled, return_std=True)
+        if mogp_log is not None:
+            mean_log_mogp, std_log_mogp = mogp_log.predict(X_plot_scaled, return_std=True)
+
+        # Legend goes in bottom-left of Output 3 graph on the RIGHT column
+        legend_row = min(2, p - 1)
+        legend_ax = axes[legend_row, 0]
+
+        for j in range(p):
+            # -------- Left column (LHS) --------
+            axL = axes[j, 0]
+            add_labels_L = False  # keep legend only on the designated axis
+
+            axL.scatter(X_lhs[:, 0], Y_lhs[:, j], s=18, color="black", alpha=0.75, linewidths=0.0,
+                        label="Training data" if axL is legend_ax else None, zorder=5)
+
+            axL.plot(X_plot[:, 0], Y_true_plot[:, j], color="black", linestyle="-", linewidth=1.6,
+                     label="True function" if axL is legend_ax else None, zorder=2)
+
+            plot_mean_and_interval_lines(
+                axL, X_plot[:, 0], mean_lhs_moogp[:, j], std_lhs_moogp[:, j],
+                label_line="MOOGP" if axL is legend_ax else None,
+                color=moogp_style["color"], linestyle=moogp_style["linestyle"], alpha_fill=0.12
+            )
+            if mogp_lhs is not None:
+                plot_mean_and_interval_lines(
+                    axL, X_plot[:, 0], mean_lhs_mogp[:, j], std_lhs_mogp[:, j],
+                    label_line="MOGP" if axL is legend_ax else None,
+                    color=mogp_style["color"], linestyle=mogp_style["linestyle"], alpha_fill=0.10
+                )
+
+            # y-label only on left column
+            axL.set_ylabel(f"Output {j+1}")
+            axL.tick_params(axis="both", which="both", top=False, right=False)
+
+            # Panel label (no title)
+            if j == 0:
+                axL.text(0.02, 0.96, left_label, transform=axL.transAxes, va="top")
+
+            # -------- Right column (log-LHS) --------
+            axR = axes[j, 1]
+
+            axR.scatter(X_log[:, 0], Y_log[:, j], s=18, color="black", alpha=0.75, linewidths=0.0,
+                        label="Training data" if axR is legend_ax else None, zorder=5)
+
+            axR.plot(X_plot[:, 0], Y_true_plot[:, j], color="black", linestyle="-", linewidth=1.6,
+                     label="True function" if axR is legend_ax else None, zorder=2)
+
+            if moogp_log is not None:
+                plot_mean_and_interval_lines(
+                    axR, X_plot[:, 0], mean_log_moogp[:, j], std_log_moogp[:, j],
+                    label_line="MOOGP" if axR is legend_ax else None,
+                    color=moogp_style["color"], linestyle=moogp_style["linestyle"], alpha_fill=0.12
+                )
+            if mogp_log is not None:
+                plot_mean_and_interval_lines(
+                    axR, X_plot[:, 0], mean_log_mogp[:, j], std_log_mogp[:, j],
+                    label_line="MOGP" if axR is legend_ax else None,
+                    color=mogp_style["color"], linestyle=mogp_style["linestyle"], alpha_fill=0.10
+                )
+
+            axR.tick_params(axis="both", which="both", top=False, right=False)
+
+            if j == 0:
+                axR.text(0.02, 0.96, right_label, transform=axR.transAxes, va="top")
+
+        # x labels on bottom row
+        axes[-1, 0].set_xlabel("x")
+        axes[-1, 1].set_xlabel("x")
+
+        # Legend: only on (Output 3, right col), boxed, deduped
+        handles, labels = legend_ax.get_legend_handles_labels()
+        seen = set()
+        uniq = [(h, l) for h, l in zip(handles, labels) if l and (l not in seen and not seen.add(l))]
+        if uniq:
+            leg = legend_ax.legend(
+                [h for h, _ in uniq],
+                [l for _, l in uniq],
+                loc="lower left",
+                frameon=True,
+                fancybox=False,
+                framealpha=1.0,
+                handlelength=2.8,
+                borderaxespad=0.6,
+            )
+            leg.get_frame().set_edgecolor("black")
+            leg.get_frame().set_linewidth(0.8)
 
         return fig
 
@@ -275,16 +493,23 @@ def plot_trend_recovery_two_designs(
     right_label="log-LHS (rescaled)",
 ):
     """
-    Two panels (like the example):
-      left: trends fit under LHS
-      right: trends fit under log-LHS (rescaled)
+    Two-panel trend comparison:
+      left: observation scheme 1
+      right: observation scheme 2
 
-    Shows: Training points, True function (solid black),
-           Least Squares trend, MOOGP trend, MOGP trend.
+    Shows:
+      - training observations
+      - true function
+      - OLS fitted linear trend
+      - MOOGP fitted linear trend
+      - MOGP fitted linear trend
     """
     import matplotlib as mpl
     import matplotlib.pyplot as plt
     import numpy as np
+
+    if output_idx not in (0, 1, 2):
+        raise ValueError("output_idx must be 0, 1, or 2.")
 
     paper_rc = {
         "font.family": "serif",
@@ -301,61 +526,111 @@ def plot_trend_recovery_two_designs(
         "savefig.dpi": 600,
     }
 
-    def trend_from_model(model, X_plot_scaled):
-        Gp = make_G({"X_scaled": X_plot_scaled}, model.terms,
-                    one_based=model.one_based, return_names=False)
-        Bhat = model.cache["bhat"]  # (r, p)
-        return (Gp @ Bhat)[:, output_idx]
-
-    def ols_trend(X_train, Y_train, X_plot):
-        G = np.column_stack([np.ones_like(X_train[:, 0]), X_train[:, 0]])
-        b, *_ = np.linalg.lstsq(G, Y_train[:, [output_idx]], rcond=None)  # (2,1)
-        Gp = np.column_stack([np.ones_like(X_plot[:, 0]), X_plot[:, 0]])
-        return (Gp @ b).ravel()
-
     with mpl.rc_context(paper_rc):
         X_plot = np.linspace(0.0, 1.0, n_plot).reshape(-1, 1)
-        X_plot_scaled = 2.0 * (X_plot - 0.5)
         y_true = forrester_true_functions(X_plot)[:, output_idx]
 
-        fig, axes = plt.subplots(1, 2, figsize=(7.6, 2.8), sharey=True, constrained_layout=True)
+        # Fit/extract all trends in the SAME raw-x basis
+        beta_ls_lhs = get_ols_betas_raw(data_lhs["X"], data_lhs["y"])
+        beta_ls_log = get_ols_betas_raw(data_log["X"], data_log["y"])
 
-        # Styles (match the example: distinct line patterns + color)
-        true_style  = dict(color="black", linestyle="-",  linewidth=2.8)
-        pts_style   = dict(color="black", s=70, zorder=5)
-        ls_style    = dict(color="tab:green", linestyle=":", linewidth=3.6)
-        moogp_style = dict(color="tab:blue",  linestyle="--", linewidth=3.6)
-        mogp_style  = dict(color="tab:red",   linestyle="-",  linewidth=3.6, alpha=0.55)
+        beta_moogp_lhs = get_model_trend_betas_raw(moogp_lhs)
+        beta_mogp_lhs = get_model_trend_betas_raw(mogp_lhs)
 
-        panels = [
-            (axes[0], data_lhs, moogp_lhs, mogp_lhs, left_label),
-            (axes[1], data_log, moogp_log, mogp_log, right_label),
+        beta_moogp_log = get_model_trend_betas_raw(moogp_log)
+        beta_mogp_log = get_model_trend_betas_raw(mogp_log)
+
+        fig, axes = plt.subplots(
+            1, 2, figsize=(7.6, 2.8), sharey=True, constrained_layout=True
+        )
+
+        true_style  = dict(color="black", linestyle="-",  linewidth=2.4)
+        pts_style   = dict(color="black", s=55, zorder=5)
+        ls_style    = dict(color="tab:green", linestyle=":",  linewidth=3.0)
+        moogp_style = dict(color="tab:blue",  linestyle="--", linewidth=3.0)
+        mogp_style  = dict(color="tab:orange",   linestyle="-",  linewidth=3.0, alpha=0.65)
+
+        panel_specs = [
+            (
+                axes[0], data_lhs, left_label,
+                beta_ls_lhs, beta_moogp_lhs, beta_mogp_lhs
+            ),
+            (
+                axes[1], data_log, right_label,
+                beta_ls_log, beta_moogp_log, beta_mogp_log
+            ),
         ]
 
-        for ax, data, moogp, mogp, panel_label in panels:
+        legend_ax = axes[0]  # legend on LHS panel
+
+        for ax, data, panel_label, beta_ls, beta_moogp, beta_mogp in panel_specs:
             Xtr = data["X"]
             Ytr = data["y"]
+            add_labels = (ax is legend_ax)
 
-            ax.scatter(Xtr[:, 0], Ytr[:, output_idx], **pts_style)
+            ax.scatter(
+                Xtr[:, 0], Ytr[:, output_idx],
+                label="Training data" if add_labels else None,
+                **pts_style
+            )
 
-            ax.plot(X_plot[:, 0], y_true, label="True function", **true_style)
+            ax.plot(
+                X_plot[:, 0], y_true,
+                label="True function" if add_labels else None,
+                **true_style
+            )
+            ax.plot(
+                X_plot[:, 0],
+                eval_linear_trend(X_plot, beta_ls, output_idx),
+                label="Least squares" if add_labels else None,
+                **ls_style,
+            )
+            ax.plot(
+                X_plot[:, 0],
+                eval_linear_trend(X_plot, beta_moogp, output_idx),
+                label="MOOGP" if add_labels else None,
+                **moogp_style,
+            )
+            ax.plot(
+                X_plot[:, 0],
+                eval_linear_trend(X_plot, beta_mogp, output_idx),
+                label="MOGP" if add_labels else None,
+                **mogp_style,
+            )
 
-            y_ls = ols_trend(Xtr, Ytr, X_plot)
-            ax.plot(X_plot[:, 0], y_ls, label="Least squares", **ls_style)
+            ax.set_xlabel("Input")
+            ax.text(
+                0.03, 0.95, panel_label,
+                transform=ax.transAxes,
+                va="top",
+                bbox=dict(
+                    facecolor="white",
+                    edgecolor="none",
+                    alpha=1.0,
+                    boxstyle="square,pad=0.15",
+                ),
+                zorder=10,
+            )
 
-            y_moogp = trend_from_model(moogp, X_plot_scaled)
-            ax.plot(X_plot[:, 0], y_moogp, label="MOOGP trend", **moogp_style)
+        axes[0].set_ylabel(f"Output {output_idx + 1}")
 
-            y_mogp = trend_from_model(mogp, X_plot_scaled)
-            ax.plot(X_plot[:, 0], y_mogp, label="MOGP trend", **mogp_style)
-
-            ax.set_xlabel("input")
-            ax.text(0.03, 0.95, panel_label, transform=ax.transAxes, va="top")
-
-        axes[0].set_ylabel("output")
-
-        # Legend in bottom-left of RIGHT panel (like your earlier preference)
-        axes[1].legend(loc="lower right", frameon=False, handlelength=2.8)
+        # Boxed legend on LHS panel
+        handles, labels = legend_ax.get_legend_handles_labels()
+        seen = set()
+        uniq = [(h, l) for h, l in zip(handles, labels) if l and (l not in seen and not seen.add(l))]
+        if uniq:
+            leg = legend_ax.legend(
+                [h for h, _ in uniq],
+                [l for _, l in uniq],
+                loc="lower left",
+                frameon=True,
+                fancybox=False,
+                framealpha=1.0,
+                handlelength=2.8,
+                borderaxespad=0.6,
+            )
+            leg.get_frame().set_edgecolor("black")
+            leg.get_frame().set_linewidth(0.8)
 
         return fig
 
@@ -486,23 +761,38 @@ def plot_trend_vs_ls(model, X, X_scaled, Y, n_plot=200, title_suffix=""):
     fig.tight_layout()
     return fig
 
-def evaluate_moogp(model, data, error_per_output, non_ortho_model=None, ols=True, n_test=200, seed=999):
+def evaluate_moogp(
+    model,
+    data,
+    error_per_output,
+    non_ortho_model=None,
+    ols=True,
+    n_test=200,
+    seed=999,
+    output_idx=0,
+    n_rmspe=400,
+    scheme_name=None,
+):
+    """
+    Returns:
+      - predictive: your original train/test table inputs
+      - trend_table: RMSPE + beta0/beta1 for one observation scheme
+                     (to be compared later across two schemes)
+    """
 
-    # Generate data
-    
     X_train_scaled = data["X_scaled"]
     X_train_raw = data["X"]
     Y_train = data["y"]
     F_train = data["f"]
-    
+
     n_train, d = X_train_scaled.shape
     p = Y_train.shape[1]
-    
+
     def get_metrics(ftrue, ytrue, ypred, yvar=None, train=False, modelname=""):
         rec_rmse_val = rmse(ftrue, ypred)
         pred_rmse_val = rmse(ytrue, ypred)
         nrmse_val = normalized_rmse(ytrue, ypred)
-        
+
         if yvar is not None:
             pcover, pwidth = intervalstats(ytrue, ypred, yvar)
             dss_val = dss(ytrue, ypred, yvar, use_diag=True)
@@ -511,16 +801,15 @@ def evaluate_moogp(model, data, error_per_output, non_ortho_model=None, ols=True
 
         split_label = "train set metrics" if train else "test set metrics"
 
-        
         return {
-            'modelname': modelname,
-            'modeltrain': split_label,
-            'predrmse': pred_rmse_val,
-            'recrmse': rec_rmse_val,
-            'nrmse': nrmse_val,
-            'pcover': pcover,
-            'pwidth': pwidth,
-            'dss': dss_val
+            "modelname": modelname,
+            "modeltrain": split_label,
+            "predrmse": pred_rmse_val,
+            "recrmse": rec_rmse_val,
+            "nrmse": nrmse_val,
+            "pcover": pcover,
+            "pwidth": pwidth,
+            "dss": dss_val,
         }
 
     # -------------------
@@ -528,55 +817,191 @@ def evaluate_moogp(model, data, error_per_output, non_ortho_model=None, ols=True
     # -------------------
     Y_train_pred, Y_train_std = model.predict(X_train_scaled, return_std=True)
     moogp_train = get_metrics(F_train, Y_train, Y_train_pred, Y_train_std**2, train=True, modelname="MOOGP")
-    
+
     non_ortho_train = None
-    if non_ortho_model:
+    if non_ortho_model is not None:
         ypred, ypredstd = non_ortho_model.predict(X_train_scaled, return_std=True)
-        non_ortho_train = get_metrics(F_train,Y_train, ypred, ypredstd**2, train=True, modelname="MOGP")
-        
+        non_ortho_train = get_metrics(F_train, Y_train, ypred, ypredstd**2, train=True, modelname="MOGP")
+
     ols_train = None
+    B_ls = None
     if ols:
+        B_ls = get_ols_betas_raw(X_train_raw, Y_train)
         G_ls_train = np.column_stack([np.ones((n_train, 1)), X_train_raw])
-        B_ls, *_ = np.linalg.lstsq(G_ls_train, Y_train, rcond=None)
         Y_train_pred_ls = G_ls_train @ B_ls
         ols_train = get_metrics(F_train, Y_train, Y_train_pred_ls, yvar=None, train=True, modelname="OLS")
-    
+
     # -------------------
     # TEST METRICS
     # -------------------
-    test_data = generate_forrester_data(n=n_test, seed=seed, with_error=True, error_per_output=error_per_output)
+    test_data = generate_forrester_data(
+        n=n_test,
+        seed=seed,
+        with_error=True,
+        error_per_output=error_per_output,
+    )
     X_test_scaled = test_data["X_scaled"]
     X_test_raw = test_data["X"]
-    F_test = test_data["f"] 
+    F_test = test_data["f"]
     Y_test = test_data["y"]
 
     Y_test_pred, Y_test_std = model.predict(X_test_scaled, return_std=True)
-    moogp_test = get_metrics(F_test,Y_test, Y_test_pred, Y_test_std**2, train=False, modelname="MOOGP")
+    moogp_test = get_metrics(F_test, Y_test, Y_test_pred, Y_test_std**2, train=False, modelname="MOOGP")
 
     non_ortho_test = None
-    if non_ortho_model:
+    if non_ortho_model is not None:
         ypred, ypredstd = non_ortho_model.predict(X_test_scaled, return_std=True)
-        non_ortho_test = get_metrics(F_test,Y_test, ypred, ypredstd**2, train=False, modelname="MOGP")
-    
+        non_ortho_test = get_metrics(F_test, Y_test, ypred, ypredstd**2, train=False, modelname="MOGP")
+
     ols_test = None
     if ols:
         G_ls_test = np.column_stack([np.ones((n_test, 1)), X_test_raw])
         Y_test_pred_ls = G_ls_test @ B_ls
-        # CORRECTED: Evaluated on Y_test instead of Y_train, train=False
-        ols_test = get_metrics(F_test,Y_test, Y_test_pred_ls, yvar=None, train=False, modelname="OLS")
-    
-    # CORRECTED: Standardized return dict keys
-    return {
+        ols_test = get_metrics(F_test, Y_test, Y_test_pred_ls, yvar=None, train=False, modelname="OLS")
+
+    predictive = {
         "moogp": {"train": moogp_train, "test": moogp_test},
-        "mogp": {"train": non_ortho_train, "test": non_ortho_test} if non_ortho_model else None,
+        "mogp": {"train": non_ortho_train, "test": non_ortho_test} if non_ortho_model is not None else None,
         "ols": {"train": ols_train, "test": ols_test} if ols else None,
     }
 
+    # -------------------
+    # PLUMLEE-JOSEPH-STYLE TREND TABLE (single scheme)
+    # RMSPE over 400 equally spaced points + fitted betas
+    # -------------------
+    X_grid = np.linspace(0.0, 1.0, n_rmspe).reshape(-1, 1)
+    grid_data = generate_forrester_data(
+        n=n_rmspe,
+        seed=seed,
+        with_error=False,
+        X_override=X_grid,
+    )
+    X_grid_scaled = grid_data["X_scaled"]
+    F_grid = grid_data["f"]
+
+    trend_table = {
+        "scheme_name": scheme_name,
+        "output_idx": output_idx,
+        "n_rmspe": n_rmspe,
+        "rows": {}
+    }
+
+    # OLS
+    if ols:
+        G_grid_ls = np.column_stack([np.ones((n_rmspe, 1)), X_grid])
+        Y_grid_pred_ls = G_grid_ls @ B_ls
+        trend_table["rows"]["ols"] = {
+            "rmspe": rmspe_1d(F_grid[:, output_idx], Y_grid_pred_ls[:, output_idx]),
+            "beta0": float(B_ls[0, output_idx]),
+            "beta1": float(B_ls[1, output_idx]),
+        }
+
+    # MOOGP
+    Y_grid_pred_moogp, _ = model.predict(X_grid_scaled, return_std=True)
+    beta_moogp = get_model_trend_betas_raw(model)
+    trend_table["rows"]["moogp"] = {
+        "rmspe": rmspe_1d(F_grid[:, output_idx], Y_grid_pred_moogp[:, output_idx]),
+        "beta0": float(beta_moogp[0, output_idx]),
+        "beta1": float(beta_moogp[1, output_idx]),
+    }
+
+    # MOGP
+    if non_ortho_model is not None:
+        Y_grid_pred_mogp, _ = non_ortho_model.predict(X_grid_scaled, return_std=True)
+        beta_mogp = get_model_trend_betas_raw(non_ortho_model)
+        trend_table["rows"]["mogp"] = {
+            "rmspe": rmspe_1d(F_grid[:, output_idx], Y_grid_pred_mogp[:, output_idx]),
+            "beta0": float(beta_mogp[0, output_idx]),
+            "beta1": float(beta_mogp[1, output_idx]),
+        }
+
+    return {
+        "predictive": predictive,
+        "trend_table": trend_table,
+    }
+
+def print_predictive_table(results, scheme_label):
+    """
+    Prints your original predictive train/test table.
+    Expects results to be the output of evaluate_moogp(...).
+    """
+    predictive = results["predictive"]
+
+    print("-" * 35 + scheme_label + "-" * 35)
+    print(f"{'Model':<8} | {'Split':<6} | {'Pred RMSE':<10} | {'Rec RMSE':<10} | {'NRMSE':<8} | {'Coverage':<10} | {'Width':<8} | {'DSS':<8}")
+    print("-" * 95)
+
+    for model_key, splits in predictive.items():
+        if splits is None:
+            continue
+
+        for split_key, metrics in splits.items():
+            pred_rmse_val = f"{metrics['predrmse']:.4f}" if metrics['predrmse'] is not None else "N/A"
+            rec_rmse_val = f"{metrics['recrmse']:.4f}" if metrics['recrmse'] is not None else "N/A"
+            nrmse_val = f"{metrics['nrmse']:.4f}" if metrics['nrmse'] is not None else "N/A"
+            pcover_val = f"{metrics['pcover']:.4f}" if metrics['pcover'] is not None else "N/A"
+            pwidth_val = f"{metrics['pwidth']:.4f}" if metrics['pwidth'] is not None else "N/A"
+            dss_val = f"{metrics['dss']:.4f}" if metrics['dss'] is not None else "N/A"
+
+            split_name = "Train" if "train" in split_key else "Test"
+
+            print(f"{model_key.upper():<8} | {split_name:<6} | {pred_rmse_val:<10} | {rec_rmse_val:<10} | {nrmse_val:<8} | {pcover_val:<10} | {pwidth_val:<8} | {dss_val:<8}")
+
+
+def print_trend_comparison_table(results_scheme1, results_scheme2, scheme1_label="LHS", scheme2_label="log-LHS"):
+    """
+    Prints the Plumlee-Joseph-style comparison table using the two trend_table blocks.
+    """
+    t1 = results_scheme1["trend_table"]
+    t2 = results_scheme2["trend_table"]
+
+    output_idx_1 = t1["output_idx"]
+    output_idx_2 = t2["output_idx"]
+    if output_idx_1 != output_idx_2:
+        raise ValueError("Both trend tables must use the same output_idx.")
+
+    rows1 = t1["rows"]
+    rows2 = t2["rows"]
+
+    print()
+    print(f"Trend comparison for Output {output_idx_1 + 1}")
+    print(f"{'Model':<8} | "
+          f"{scheme1_label + ' RMSPE':<14} | {'beta0':<10} | {'beta1':<10} | "
+          f"{scheme2_label + ' RMSPE':<14} | {'beta0':<10} | {'beta1':<10} | "
+          f"{'|Δbeta0|':<10} | {'|Δbeta1|':<10}")
+    print("-" * 120)
+
+    row_order = ["ols", "moogp", "mogp"]
+    row_names = {"ols": "LS", "moogp": "MOOGP", "mogp": "MOGP"}
+
+    for key in row_order:
+        if key not in rows1 or key not in rows2:
+            continue
+
+        a = rows1[key]
+        b = rows2[key]
+
+        db0 = abs(b["beta0"] - a["beta0"])
+        db1 = abs(b["beta1"] - a["beta1"])
+
+        print(f"{row_names[key]:<8} | "
+              f"{a['rmspe']:<14.6f} | {a['beta0']:<10.4f} | {a['beta1']:<10.4f} | "
+              f"{b['rmspe']:<14.6f} | {b['beta0']:<10.4f} | {b['beta1']:<10.4f} | "
+              f"{db0:<10.4f} | {db1:<10.4f}")
 
 if __name__ == "__main__":
+    # ----- Choice Variables -----
+    
+    # original n_train = 25
     n_train = 25
     # original seed 67
-    seed = 2
+    seed = 67
+    
+    trend_output_idx = 2
+
+    # --------------------------------
+    # ------- Data Generation --------
+    #--------------------------------
 
     outdir = Path(__file__).resolve().parent / "figs"
     outdir.mkdir(parents=True, exist_ok=True)
@@ -605,79 +1030,72 @@ if __name__ == "__main__":
     print(f"Done in {elapsed:.3f}s")
 
     fig_pred = plot_forrester_fit(moogp_lhs, X1, Xs1, Y1, non_ortho_model=mogp_lhs)
-    # fig_pred.savefig(outdir / "forrester_fit_lhs.png", dpi=600, bbox_inches="tight")
-    # fig_pred.savefig(outdir / "forrester_fit_lhs.pdf", dpi=600, bbox_inches="tight")
+    fig_pred.savefig(outdir / "forrester_fit_lhs.png", dpi=600, bbox_inches="tight")
+    fig_pred.savefig(outdir / "forrester_fit_lhs.pdf", dpi=600, bbox_inches="tight")
     
     fig_pred = plot_forrester_fit(moogp_log, X2, Xs2, Y2, non_ortho_model=mogp_log)
-    # fig_pred.savefig(outdir / "forrester_fit_log.png", dpi=600, bbox_inches="tight")
-    # fig_pred.savefig(outdir / "forrester_fit_log.pdf", dpi=600, bbox_inches="tight")
+    fig_pred.savefig(outdir / "forrester_fit_log.png", dpi=600, bbox_inches="tight")
+    fig_pred.savefig(outdir / "forrester_fit_log.pdf", dpi=600, bbox_inches="tight")
+
+    fig = plot_forrester_fit_side_by_side(
+    moogp_lhs=moogp_lhs, X_lhs=data_lhs["X"], Y_lhs=data_lhs["y"], mogp_lhs=mogp_lhs,
+    moogp_log=moogp_log, X_log=data_log["X"], Y_log=data_log["y"], mogp_log=mogp_log,
+    )
+
+    # Single side-by-side plot
+    fig.savefig(outdir / "forrester_fit_lhs_vs_loglhs.png", dpi=600, bbox_inches="tight")
+    fig.savefig(outdir / "forrester_fit_lhs_vs_loglhs.pdf", dpi=600, bbox_inches="tight")
     
 
     fig_trend = plot_trend_recovery_two_designs(
         data_lhs, moogp_lhs, mogp_lhs,
         data_log, moogp_log, mogp_log,
-        output_idx=1,  # 0->Output1, 1->Output2, 2->Output3
+        output_idx=trend_output_idx,  # 0->Output1, 1->Output2, 2->Output3
         left_label="LHS",
-        right_label="log-LHS (rescaled)",
+        right_label="log-LHS",
     )
 
     # for this second graph, maybe do a linspace with n=1000 and OLS to get "true" trend
     # then look at the change in coefficients across the data shifts
 
-    fig_trend.savefig(outdir / "forrester_trend_recovery.png", dpi=600, bbox_inches="tight")
-    fig_trend.savefig(outdir / "forrester_trend_recovery.pdf", dpi=600, bbox_inches="tight")
+    fig_trend.savefig(outdir / f"forrester_trend_recovery_output{trend_output_idx + 1}.png", dpi=600, bbox_inches="tight")
+    fig_trend.savefig(outdir / f"forrester_trend_recovery_output{trend_output_idx + 1}.pdf", dpi=600, bbox_inches="tight")
 
-    
-    results = evaluate_moogp(moogp_lhs, data=data_lhs, error_per_output=[10, 1, 0.05],
-                                 non_ortho_model=mogp_lhs,ols=True)
+    # -----------------------------
+    # Evaluation: both tables
+    # -----------------------------
+    results_lhs = evaluate_moogp(
+        moogp_lhs,
+        data=data_lhs,
+        error_per_output=[10, 1, 0.05],
+        non_ortho_model=mogp_lhs,
+        ols=True,
+        output_idx=trend_output_idx,
+        scheme_name="LHS",
+    )
 
-    # Print the header
-    print("-"*35 + "LHS"+ "-"*35)
-    print(f"{'Model':<8} | {'Split':<6} | {'Pred RMSE':<8} | {'Rec RMSE':<8}| {'NRMSE':<8} | {'Coverage':<10} | {'Width':<8} | {'DSS':<8}")
-    print("-" * 85)
+    results_log = evaluate_moogp(
+        moogp_log,
+        data=data_log,
+        error_per_output=[10, 1, 0.05],
+        non_ortho_model=mogp_log,
+        ols=True,
+        output_idx=trend_output_idx,
+        scheme_name="log-LHS",
+    )
 
-    # Iterate through the models and their splits
-    for model_key, splits in results.items():
-        if splits is None:
-            continue # Skip if model wasn't run (e.g., MOGP or OLS)
-            
-        for split_key, metrics in splits.items():
-            # Handle cases where OLS might not have variance metrics
-            pred_rmse_val = f"{metrics['predrmse']:.4f}" if metrics['predrmse'] is not None else "N/A"
-            rec_rmse_val = f"{metrics['recrmse']:.4f}" if metrics['recrmse'] is not None else "N/A"
-            nrmse_val = f"{metrics['nrmse']:.4f}" if metrics['nrmse'] is not None else "N/A"
-            pcover_val = f"{metrics['pcover']:.4f}" if metrics['pcover'] is not None else "N/A"
-            pwidth_val = f"{metrics['pwidth']:.4f}" if metrics['pwidth'] is not None else "N/A"
-            dss_val = f"{metrics['dss']:.4f}" if metrics['dss'] is not None else "N/A"
-            
-            split_name = "Train" if "train" in split_key else "Test"
-            
-            print(f"{model_key.upper():<8} | {split_name:<6} | {pred_rmse_val:<8} | {rec_rmse_val:<8} | {nrmse_val:<8} | {pcover_val:<10} | {pwidth_val:<8} | {dss_val:<8}")
+    # Original predictive tables
+    print_predictive_table(results_lhs, "LHS")
+    print()
+    print_predictive_table(results_log, "log-LHS")
 
-    results_log = evaluate_moogp(moogp_log, data=data_log, error_per_output=[10, 1, 0.05],
-                                 non_ortho_model=mogp_log,ols=True)
+    # Trend comparison tables
+    print()
+    print_trend_comparison_table(
+        results_lhs,
+        results_log,
+        scheme1_label="LHS",
+        scheme2_label="log-LHS",
+    )
 
-    print("-"*30 + "Log"+ "-"*30)
-
-    print(f"{'Model':<8} | {'Split':<6} | {'Pred RMSE':<8} | {'Rec RMSE':<8}| {'NRMSE':<8} | {'Coverage':<10} | {'Width':<8} | {'DSS':<8}")
-    print("-" * 85)
-
-    # Iterate through the models and their splits
-    for model_key, splits in results_log.items():
-        if splits is None:
-            continue # Skip if model wasn't run (e.g., MOGP or OLS)
-            
-        for split_key, metrics in splits.items():
-            # Handle cases where OLS might not have variance metrics
-            pred_rmse_val = f"{metrics['predrmse']:.4f}" if metrics['predrmse'] is not None else "N/A"
-            rec_rmse_val = f"{metrics['recrmse']:.4f}" if metrics['recrmse'] is not None else "N/A"
-            nrmse_val = f"{metrics['nrmse']:.4f}" if metrics['nrmse'] is not None else "N/A"
-            pcover_val = f"{metrics['pcover']:.4f}" if metrics['pcover'] is not None else "N/A"
-            pwidth_val = f"{metrics['pwidth']:.4f}" if metrics['pwidth'] is not None else "N/A"
-            dss_val = f"{metrics['dss']:.4f}" if metrics['dss'] is not None else "N/A"
-            
-            split_name = "Train" if "train" in split_key else "Test"
-            
-            print(f"{model_key.upper():<8} | {split_name:<6} | {pred_rmse_val:<8} | {rec_rmse_val:<8} | {nrmse_val:<8} | {pcover_val:<10} | {pwidth_val:<8} | {dss_val:<8}")
-    
     plt.show()

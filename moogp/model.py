@@ -1,6 +1,5 @@
 import autograd.numpy as np
 
-from numpy.linalg import LinAlgError, norm
 from scipy.linalg import cho_factor, cho_solve, solve, solve_triangular
 from scipy.optimize import minimize
 
