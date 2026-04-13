@@ -80,7 +80,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--maxiter",
         type=int,
-        default=100,
+        default=1000,
         help="Optimizer max iterations for MOOGP and MOGP.",
     )
     parser.add_argument(

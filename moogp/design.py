@@ -1,7 +1,7 @@
 import numpy as np
 
 
-def parse_terms_to_index_sets(terms, d, one_based=True):
+def parse_terms_to_index_sets(terms, d, one_based=True, allow_repeated=False):
     """Parse a list of regression *terms* into index-sets.
 
     This helper is shared by both the design-matrix builder :func:`make_G` and the
@@ -50,7 +50,7 @@ def parse_terms_to_index_sets(terms, d, one_based=True):
             raise ValueError(f"Interactions must have length >= 2; got {t}")
         if any((i < 0 or i >= d) for i in idxs):
             raise ValueError(f"Some indices in {t} are out of range for d={d}.")
-        if len(set(idxs)) != len(idxs):
+        if (not allow_repeated) and (len(set(idxs)) != len(idxs)):
             raise ValueError(f"Duplicate indices in interaction {t}")
 
         J_sets.append(tuple(sorted(idxs)))
@@ -72,7 +72,7 @@ def make_G(data, terms, one_based=True, return_names=False):
     n, d = X.shape
 
     # Validate `terms` early (also ensures consistent parsing w.r.t. kernels.py)
-    J_sets = parse_terms_to_index_sets(terms, d, one_based=one_based)
+    J_sets = parse_terms_to_index_sets(terms, d, one_based=one_based, allow_repeated=True)
     
     cols = []
     names = []

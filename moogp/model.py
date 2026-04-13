@@ -1,5 +1,6 @@
 import autograd.numpy as np
 
+from autograd.scipy.linalg import solve_triangular as ag_solve_triangular
 from scipy.linalg import cho_factor, cho_solve, solve, solve_triangular
 from scipy.optimize import minimize
 
@@ -59,7 +60,8 @@ def unpack_theta(
         Psi_free = t[off:off + need].reshape(p, q)
         off += need
 
-        Psi = Psi_free.copy()
+        # Keep this autograd-friendly when theta_raw carries ArrayBox values.
+        Psi = 1.0 * Psi_free
         if normalize_cols:
             nrms = np.linalg.norm(Psi, axis=0)
             nrms = np.where(nrms == 0, 1.0, nrms) # prevent divide by zero
@@ -106,6 +108,30 @@ def build_cross_K(Psi, Cj_list):
         K += np.kron(Wj, Cj_list[j])
     return K
 
+
+def gls_bhat(Y, G, Ky_chol):
+    """Generalized least-squares estimate of the trend coefficients."""
+    Y = np.asarray(Y, float)
+    G = np.asarray(G, float)
+
+    if Y.ndim != 2 or G.ndim != 2:
+        raise ValueError("Y and G must both be rank-2 arrays.")
+    if Y.shape[0] != G.shape[0]:
+        raise ValueError(f"Y and G must share the same number of rows; got {Y.shape[0]} and {G.shape[0]}.")
+
+    p = Y.shape[1]
+    r = G.shape[1]
+    Gy = build_Gy(G, p)
+    vecY = vecF(Y)
+
+    z = cho_solve(Ky_chol, Gy, check_finite=False)
+    alpha = cho_solve(Ky_chol, vecY, check_finite=False)
+
+    A_gls = Gy.T @ z
+    b_gls = Gy.T @ alpha
+    beta_vec = np.linalg.solve(A_gls, b_gls)
+    return unvecF(beta_vec, r, p)
+
 def init_phi(Y, q, n):
     """
     Build ``Phi`` and ``d`` from the SVD of ``Y``.
@@ -126,6 +152,106 @@ def init_phi(Y, q, n):
     Phi = V[:, :q] * np.sqrt(n) / s_q[None, :]
     d = n / (s_q ** 2)
     return Phi, d
+
+
+def _normalize_standardize_y_mode(standardize_y):
+    """Normalize user-facing output-standardization options."""
+    if standardize_y in (False, None):
+        return False
+    if standardize_y is True:
+        return "zscore"
+    if isinstance(standardize_y, str):
+        mode = standardize_y.lower()
+        if mode in {"zscore", "robust"}:
+            return mode
+    raise ValueError("standardize_y must be one of False, True, 'zscore', or 'robust'.")
+
+
+def _compute_y_center_scale(Y, mode):
+    """Return per-output center and spread for the working response scale."""
+    Y = np.asarray(Y, float)
+    p = Y.shape[1]
+
+    if mode is False:
+        return np.zeros(p, dtype=float), np.ones(p, dtype=float)
+
+    if mode == "zscore":
+        center = np.mean(Y, axis=0)
+        scale = np.std(Y, axis=0, ddof=1)
+    elif mode == "robust":
+        center = np.median(Y, axis=0)
+        scale = np.median(np.abs(Y - center[None, :]), axis=0)
+    else:  # pragma: no cover - guarded by _normalize_standardize_y_mode
+        raise ValueError(f"Unsupported standardize_y mode: {mode}")
+
+    scale = np.where(scale > 1e-12, scale, 1.0)
+    return np.asarray(center, float), np.asarray(scale, float)
+
+
+def compute_working_y(Y, standardize_y):
+    """Project raw outputs onto the model's internal working scale."""
+    mode = _normalize_standardize_y_mode(standardize_y)
+    center, scale = _compute_y_center_scale(Y, mode)
+    Y_work = (np.asarray(Y, float) - center[None, :]) / scale[None, :]
+    return Y_work, center, scale
+
+
+def _solve_spd_from_cholesky(chol, rhs):
+    """Solve ``A x = rhs`` given a lower-triangular Cholesky factor of ``A``."""
+    y = ag_solve_triangular(chol, rhs, lower=True)
+    return ag_solve_triangular(chol.T, y, lower=False)
+
+
+def _apply_factorized_qk(chol, d_val, rhs):
+    """Apply ``Q = (I + d C)^{-1} C`` to ``rhs`` using the factor of ``I + d C``."""
+    solved_rhs = _solve_spd_from_cholesky(chol, rhs)
+    return (rhs - solved_rhs) / d_val
+
+
+def _block_design_t_matmul(G, rhs, p):
+    """Compute ``(I_p ⊗ G)^T rhs`` without forming the Kronecker product."""
+    was_vec = rhs.ndim == 1
+    rhs2 = rhs[:, None] if was_vec else rhs
+
+    n, _ = G.shape
+    if rhs2.shape[0] != n * p:
+        raise ValueError(f"rhs has incompatible leading dimension {rhs2.shape[0]} (expected {n * p}).")
+
+    out = np.vstack([G.T @ rhs2[j * n:(j + 1) * n, :] for j in range(p)])
+    return out[:, 0] if was_vec else out
+
+
+def _block_design_matvec(G, beta_vec, p):
+    """Compute ``(I_p ⊗ G) beta_vec`` without forming the Kronecker product."""
+    bhat = unvecF(beta_vec, G.shape[1], p)
+    return vecF(G @ bhat)
+
+
+def _profiled_gls_terms(solve_Ky, G, Gy, vecY, p, *, build_cache):
+    """Profile out the trend coefficients using exact GLS identities."""
+    if Gy.size == 0:
+        alpha = solve_Ky(vecY)
+        qf = np.dot(vecY, alpha)
+        if build_cache:
+            return qf, np.zeros((0, p)), vecY, alpha
+        return qf, None, None, None
+
+    solved_rhs = solve_Ky(np.concatenate((Gy, vecY[:, None]), axis=1))
+    z = solved_rhs[:, :-1]
+    alpha = solved_rhs[:, -1]
+
+    A_gls = _block_design_t_matmul(G, z, p)
+    b_gls = _block_design_t_matmul(G, alpha, p)
+    beta_vec = np.linalg.solve(A_gls, b_gls)
+    qf = np.dot(vecY, alpha) - np.dot(b_gls, beta_vec)
+
+    if not build_cache:
+        return qf, None, None, None
+
+    bhat = unvecF(beta_vec, G.shape[1], p)
+    rvec = vecY - _block_design_matvec(G, beta_vec, p)
+    Ky_inv_rvec = alpha - z @ beta_vec
+    return qf, bhat, rvec, Ky_inv_rvec
 
 class MOOGP:
     """
@@ -148,7 +274,8 @@ class MOOGP:
                  normalize_cols=True,
                  use_diagonalized_interaction=True,
                  use_slow_kyinv=False,
-                 store_dense_ky=False):
+                 store_dense_ky=False,
+                 standardize_y=False):
         """
         Parameters
         ----------
@@ -181,14 +308,19 @@ class MOOGP:
         use_diagonalized_interaction : bool
             If True, request the manuscript fast path based on
             ``Psi = Sigma_eps^{1/2} Phi`` and block-diagonal Woodbury updates.
-            In this mode ``Phi`` (and thus ``Psi``) is rebuilt from SVD of
-            ``Y^T Y`` each likelihood call. If a fixed ``Psi`` is incompatible
-            with this parameterization, the model falls back to slow mode.
+            In this mode ``Phi`` (and thus ``Psi``) is rebuilt from the SVD of
+            ``Y`` each likelihood call. The supplied ``Psi`` is only used in the
+            dense slow path.
         use_slow_kyinv : bool
             Escape hatch for regression/debugging. If True, force the dense
             covariance/cholesky path.
         store_dense_ky : bool
             If True, keep dense ``Ky`` in cache for debugging.
+        standardize_y : bool | str
+            Optional output standardization applied internally before fitting.
+            Supported values are ``False``, ``True``/``"zscore"``, and
+            ``"robust"``. Predictions are always returned on the original
+            output scale.
         """
         self.terms = terms
         self.q = q
@@ -210,6 +342,7 @@ class MOOGP:
         self.use_diagonalized_interaction = bool(use_diagonalized_interaction)
         self.use_slow_kyinv = bool(use_slow_kyinv)
         self.store_dense_ky = bool(store_dense_ky)
+        self.standardize_y = _normalize_standardize_y_mode(standardize_y)
 
         self._data = None
         self.cache = None
@@ -218,29 +351,70 @@ class MOOGP:
         self.opt_result = None
         self.fitted = False
         self.Ky_inv_rvec_ = None
+        self.Y_raw = None
+        self.y_center_ = None
+        self.y_scale_ = None
+        self.Psi_work = None
+        self.sigma_eps2_work = None
+
+    def _to_working_y(self, Y):
+        return (np.asarray(Y, float) - self.y_center_[None, :]) / self.y_scale_[None, :]
+
+    def _from_working_mean(self, mean):
+        return np.asarray(mean, float) * self.y_scale_[None, :] + self.y_center_[None, :]
+
+    def _from_working_std(self, std):
+        return np.asarray(std, float) * self.y_scale_[None, :]
+
+    def _psi_to_working_scale(self, Psi):
+        if Psi is None:
+            return None
+        return np.asarray(Psi, float) / self.y_scale_[:, None]
+
+    def _psi_from_working_scale(self, Psi):
+        if Psi is None:
+            return None
+        # Keep this compatible with autograd-traced arrays inside _nll.
+        return Psi * self.y_scale_[:, None]
+
+    def _sigma_eps2_to_working_scale(self, sigma_eps2):
+        if sigma_eps2 is None:
+            return None
+        return np.asarray(sigma_eps2, float).ravel() / (self.y_scale_ ** 2)
+
+    def _sigma_eps2_from_working_scale(self, sigma_eps2):
+        if sigma_eps2 is None:
+            return None
+        # Keep this compatible with autograd-traced arrays inside _nll.
+        return sigma_eps2 * (self.y_scale_ ** 2)
     
     def _prepare_data(self, data):
         X = np.asarray(data["X_scaled"])
-        Y = np.asarray(data.get("Y", data.get("y")))
+        Y_raw = np.asarray(data.get("Y", data.get("y")))
         n, d = X.shape
-        p = Y.shape[1]
+        p = Y_raw.shape[1]
+
+        Y, self.y_center_, self.y_scale_ = compute_working_y(Y_raw, self.standardize_y)
 
         self._data = data
         self.X = X
         self.Y = Y
+        self.Y_raw = Y_raw
         self.n = n
         self.d = d
         self.p = p
         self.Ky_inv_rvec_ = None
+        self.Psi_work = self._psi_to_working_scale(self.Psi)
+        self.sigma_eps2_work = self._sigma_eps2_to_working_scale(self.sigma_eps2)
 
-        if self.Psi is not None:
-            if self.Psi.shape != (p, self.q):
-                raise ValueError(f"Psi shape {self.Psi.shape} ≠ (p={p}, q={self.q})")
+        if self.Psi_work is not None:
+            if self.Psi_work.shape != (p, self.q):
+                raise ValueError(f"Psi shape {self.Psi_work.shape} ≠ (p={p}, q={self.q})")
 
-        # Cache SVD
-        if (self.sigma_eps2 is not None) and (self.sigma_eps2.size != p):
-            raise ValueError(f"sigma_eps2 length {self.sigma_eps2.size} ≠ p={p}")
-        
+        if (self.sigma_eps2_work is not None) and (self.sigma_eps2_work.size != p):
+            raise ValueError(f"sigma_eps2 length {self.sigma_eps2_work.size} ≠ p={p}")
+
+        # Build the fast low-rank basis from the working-scale outputs.
         if self.use_diagonalized_interaction:
             self.Phi_fast, self.d_vals_fast = init_phi(self.Y, self.q, self.n)
         else:
@@ -260,8 +434,7 @@ class MOOGP:
         n = info["n"]
         p = info["p"]
         sigma_eps2 = info["sigma_eps2"]
-        psi_c = info["psi_c"]
-        Q_list = info["Q_list"]
+        latent_factors = info["latent_factors"]
 
         if rhs2.shape[0] != n * p:
             raise ValueError(f"rhs has incompatible leading dimension {rhs2.shape[0]} (expected {n*p}).")
@@ -273,19 +446,21 @@ class MOOGP:
         # Broadcasting sigma_eps2 across the n and m dimensions
         out = Xrhs / sigma_eps2[None, :, None]
 
-        # 2. Subtract Latent GP Components
-        # mathematically: \sum_k [ Q_k @ M @ P_k ]
-        # Since P_k = psi_c[k] psi_c[k]^T, we optimize M @ P_k to (M @ psi_c[k]) @ psi_c[k]^T
-        for k in range(len(Q_list)):
-            uk = psi_c[k]  # shape (p,)
-            Qk = Q_list[k] # shape (n, n)
-            
+        # 2. Subtract latent GP updates. We keep the Cholesky factors of
+        # ``I + d_k C_k`` and apply ``Q_k @ rhs`` lazily to avoid caching dense
+        # ``Q_k`` matrices that can be reconstructed from ``C_k`` and the solve.
+        for factor in latent_factors:
+            uk = factor["psi"]      # shape (p,)
+            d_val = factor["d"]     # scalar
+            chol = factor["chol"]   # shape (n, n), lower triangular
+
             # Step A: Project outputs into the latent space -> shape (n, m)
             M_uk = np.sum(Xrhs * uk[None, :, None], axis=1)
-            
-            # Step B: Apply spatial covariance inversion -> shape (n, m)
-            Qk_M_uk = Qk @ M_uk
-            
+
+            # Step B: Apply Q_k = (I + d_k C_k)^{-1} C_k via the exact identity
+            # Q_k = (I - (I + d_k C_k)^{-1}) / d_k.
+            Qk_M_uk = _apply_factorized_qk(chol, d_val, M_uk)
+
             # Step C: Project back to the output space and subtract -> shape (n, p, m)
             out = out - (Qk_M_uk[:, None, :] * uk[None, :, None])
 
@@ -304,7 +479,7 @@ class MOOGP:
             raise RuntimeError("No cached Ky solver is available.")
         return cho_solve(Ky_chol, rhs, check_finite=False)
         
-    def _nll(self, theta_raw):
+    def _nll(self, theta_raw, *, build_cache=True):
         """
         Negative log-likelihood for the MOOGP model.
 
@@ -329,8 +504,8 @@ class MOOGP:
             normalize_cols=self.normalize_cols,
         )
 
-        Psi = Psi_th if self.learn_Psi else self.Psi
-        sigma_eps2 = sigma_eps2_th if self.learn_sigma_eps else self.sigma_eps2
+        Psi = Psi_th if self.learn_Psi else self.Psi_work
+        sigma_eps2 = sigma_eps2_th if self.learn_sigma_eps else self.sigma_eps2_work
 
         if (Psi is None) and (not use_fast):
             raise ValueError("Psi is None. Provide Psi or set learn_Psi=True.")
@@ -338,6 +513,16 @@ class MOOGP:
         if sigma_eps2 is None:
             sigma_eps2 = np.zeros(p, dtype=float)
         sigma_eps2 = np.maximum(sigma_eps2, self.min_sigma_eps2)
+
+        # A fixed Psi only matches the diagonalized fast path when it agrees
+        # with Psi = Sigma_eps^{1/2} Phi(Y) for the current sigma_eps2.
+        if use_fast and (self.Psi_work is not None):
+            Phi_fast = self.Phi_fast
+            if Phi_fast is None:
+                use_fast = False
+            else:
+                Psi_fast = np.diag(np.sqrt(sigma_eps2)) @ Phi_fast
+                use_fast = bool(np.allclose(self.Psi_work, Psi_fast, rtol=1e-8, atol=1e-10))
 
         # Design
         G = self.G
@@ -354,6 +539,7 @@ class MOOGP:
         fast_diag_info = None
         Ky = None
         Ky_chol = None
+        Psi_cache = Psi
 
         if use_fast:
             # 1. Phi from SVD of Y
@@ -363,33 +549,37 @@ class MOOGP:
             # 2. Standardized output basis (q,p)
             psi_c = Phi.T / np.sqrt(sigma_eps2)
 
-            # 3. Precompute Q_k and determinant
-            Q_list =  []
+            # 3. Precompute Cholesky factors for the Woodbury updates and the
+            # corresponding log-determinant terms.
+            latent_factors = []
             logdetK = n * np.sum(np.log(sigma_eps2))
 
             for k in range(self.q):
                 Ck_star = Cj_list[k]
                 Dk = d_vals[k]
 
-                A = np.eye(n) + Dk * Ck_star + 1e-8 * np.eye(n)   # small stabilizing jitter
+                A = np.eye(n) + Dk * Ck_star 
                 L = np.linalg.cholesky(A)
+                # log(det(A)) = 2 * sum(log(diag(L)))
                 logdetK += 2.0 * np.sum(np.log(np.diag(L)))
 
-                # Qk = Ck_star @ inv(A)  (more stable as a solve)
-                Qk = np.linalg.solve(A, Ck_star)   # equals inv(A) @ Ck_star, same eigenspace
-                Qk = 0.5 * (Qk + Qk.T)             # optional symmetrize
-                Q_list.append(Qk)
+                latent_factors.append(
+                    {
+                        "psi": psi_c[k],
+                        "d": Dk,
+                        "chol": L,
+                    }
+                )
 
             fast_diag_info = dict(
                 n=n,
                 p=p,
-                Q_list=Q_list,
-                psi_c=psi_c,
+                latent_factors=latent_factors,
                 sigma_eps2=sigma_eps2
             )
 
             solve_Ky = lambda rhs: self._apply_Ky_inv_fast(rhs, fast_diag_info)
-            Psi = np.diag(np.sqrt(sigma_eps2)) @ Phi
+            Psi_cache = (np.sqrt(sigma_eps2)[:, None] * Phi) if build_cache else None
         else:
             Ky = build_Ky(Cj_list, Psi, sigma_eps2=sigma_eps2)
             if self.jitter:
@@ -397,9 +587,19 @@ class MOOGP:
             Ky_chol = cho_factor(Ky, lower=True, check_finite=False)
             logdetK = 2.0 * np.sum(np.log(np.diag(Ky_chol[0])))
             solve_Ky = lambda rhs: cho_solve(Ky_chol, rhs, check_finite=False)
+            Psi_cache = Psi
 
         vecY = vecF(Y)
-        if r > 0:        
+        if use_fast:
+            qf, bhat, rvec, Ky_inv_rvec = _profiled_gls_terms(
+                solve_Ky,
+                G,
+                Gy,
+                vecY,
+                p,
+                build_cache=build_cache,
+            )
+        elif r > 0:
             z = solve_Ky(Gy)
             alpha = solve_Ky(vecY)
 
@@ -410,12 +610,12 @@ class MOOGP:
             bhat = unvecF(beta_vec, r, p)
             rvec = vecY - Gy @ vecF(bhat)
             Ky_inv_rvec = alpha - z @ beta_vec
+            qf = np.dot(rvec, Ky_inv_rvec)
         else:
             bhat = np.zeros((0, p))
             rvec = vecY
             Ky_inv_rvec = solve_Ky(rvec)
-    
-        qf = np.dot(rvec, Ky_inv_rvec)
+            qf = np.dot(rvec, Ky_inv_rvec)
         nll = 0.5 * (logdetK + qf + (n * p) * np.log(2.0 * np.pi))
 
         if self.use_reml:
@@ -424,29 +624,37 @@ class MOOGP:
             A = None
 
         # cache for predictions
-        self.cache = dict(
-            Ky=(Ky if self.store_dense_ky else None),
-            Ky_chol=Ky_chol,
-            Cj_list=Cj_list,
-            Psi=Psi,
-            sigma_eps2=sigma_eps2,
-            fast_diag_info=fast_diag_info,
-            G=G,
-            Gy=Gy,
-            bhat=bhat,
-            r_vec=rvec,
-            Ky_inv_rvec=Ky_inv_rvec,
-            residual_vec=rvec,
-            qf=qf,
-            logdetK=logdetK,
-            A=A,
-            lat_params=lat_params,
-            terms=terms,
-            one_based=self.one_based,
-            X=X,
-            Y=Y,
-        )
-        self.Ky_inv_rvec_ = Ky_inv_rvec
+        if build_cache:
+            self.cache = dict(
+                Ky=(Ky if self.store_dense_ky else None),
+                Ky_chol=Ky_chol,
+                Cj_list=Cj_list,
+                Psi=Psi_cache,
+                Psi_raw=self._psi_from_working_scale(Psi_cache),
+                sigma_eps2=sigma_eps2,
+                sigma_eps2_raw=self._sigma_eps2_from_working_scale(sigma_eps2),
+                used_fast=use_fast,
+                fast_diag_info=fast_diag_info,
+                G=G,
+                Gy=Gy,
+                bhat=bhat,
+                r_vec=rvec,
+                Ky_inv_rvec=Ky_inv_rvec,
+                residual_vec=rvec,
+                qf=qf,
+                logdetK=logdetK,
+                A=A,
+                lat_params=lat_params,
+                terms=terms,
+                one_based=self.one_based,
+                X=X,
+                Y=Y,
+                Y_raw=self.Y_raw,
+                y_center=self.y_center_,
+                y_scale=self.y_scale_,
+                standardize_y=self.standardize_y,
+            )
+            self.Ky_inv_rvec_ = Ky_inv_rvec
         return nll
     
     def fit(self, data, theta0, bounds=None, optimizer_opts=None):
@@ -468,10 +676,15 @@ class MOOGP:
 
         obj = lambda th: self._nll(th)
 
-        use_fast = self.use_diagonalized_interaction and (not self.use_slow_kyinv)
+        use_fast = (
+            self.use_diagonalized_interaction
+            and (not self.use_slow_kyinv)
+            and (not self.learn_Psi)
+            and (self.Psi is None)
+        )
 
         if use_fast:
-            target_obj = value_and_grad(obj)
+            target_obj = value_and_grad(lambda th: self._nll(th, build_cache=False))
             use_jac = True
         else:
             target_obj = obj
@@ -558,10 +771,11 @@ class MOOGP:
             mean_mat += np.outer(latent_mean, psi_j)
             
         mean = mean_mat
+        mean_raw = self._from_working_mean(mean)
 
         # LAZY EVALUATION: Stop here if standard deviation is not requested
         if not return_std:
-            return mean
+            return mean_raw
 
         # 3. VARIANCE PREDICTION 
         
@@ -593,5 +807,6 @@ class MOOGP:
 
         std = np.sqrt(np.maximum(diag, 0.0))
         std = unvecF(std, nstar, p)
+        std_raw = self._from_working_std(std)
         
-        return mean, std
+        return mean_raw, std_raw

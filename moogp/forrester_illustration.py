@@ -66,20 +66,49 @@ def forrester_true_functions(X):
 
     return np.concatenate([f1, f2, f3], axis=1)
 
-def fit_moogp_forrester(n_train=50, 
+FORRESTER_MANUSCRIPT_SIGMA_EPS2 = np.array([10.0, 1.0, 0.05], dtype=float)
+
+
+def build_forrester_theta0_bounds(Y, q, d):
+    """Construct the default Forrester initialization and box constraints."""
+    theta0 = []
+    bounds = []
+    for _ in range(q):
+        theta0.append(np.log(1.0))
+        theta0.extend([np.log(0.5)] * d)
+
+        bounds.append((np.log(1e-3), np.log(1e3)))
+        bounds.extend([(np.log(0.05), np.log(5.0))] * d)
+
+    theta0 = np.asarray(theta0, dtype=float)
+
+    y_var = Y.var(axis=0, ddof=1)
+    sigma_eps2_init = np.log(1e-2 * y_var)
+    theta0 = np.concatenate([theta0, sigma_eps2_init])
+
+    lb = np.maximum(1e-12, 1e-6 * y_var)
+    ub = np.maximum(lb * 10.0, 0.5 * y_var)
+    log_bounds = [(float(np.log(lbi)), float(np.log(ubi))) for lbi, ubi in zip(lb, ub)]
+    bounds.extend(log_bounds)
+    return theta0, bounds
+
+
+def fit_moogp_forrester(n_train=50,
                         seed=0,
-                        q=3, 
-                        Psi = None, 
+                        q=3,
+                        Psi=None,
                         orthogonal=True,
-                        use_fast=True, 
+                        use_fast=True,
                         learn_Psi=False,
-                        data=None):
+                        data=None,
+                        error_per_output=FORRESTER_MANUSCRIPT_SIGMA_EPS2,
+                        maxiter=500):
     if data is None:
         data = generate_forrester_data(
             n=n_train,
             seed=seed,
             with_error=True,
-            error_per_output=[10, 1, 0.05], 
+            error_per_output=error_per_output,
         )
     
     X = data["X"]          # in [0,1]
@@ -99,43 +128,35 @@ def fit_moogp_forrester(n_train=50,
         orthogonal=orthogonal,
         learn_Psi=learn_Psi,
         learn_sigma_eps=True,
-        jitter=1e-6,
+        jitter=1e-10,
         normalize_cols=True,
         use_diagonalized_interaction=use_fast  # Fast computation
     )
-    # TODO Decide whether to have default bounds inside MOOGP class
-    # 4) Build theta0 and bounds
-    theta0 = []
-    bounds = []
-    for _ in range(q):
-        # log sigma^2
-        theta0.append(np.log(1.0))
-        # log lengthscales (d dims)
-        theta0.extend([np.log(0.5)] * d)
+    theta0, bounds = build_forrester_theta0_bounds(Y, q, d)
 
-        bounds.append((np.log(1e-3), np.log(1e3)))       # sigma^2
-        bounds.extend([(np.log(0.05), np.log(5.0))] * d) # ell bounds
+    if learn_Psi:
+        if Psi is None:
+            Psi0 = np.eye(p, q, dtype=float)
+        else:
+            Psi0 = np.asarray(Psi, dtype=float)
+            if Psi0.shape != (p, q):
+                raise ValueError(f"Psi shape {Psi0.shape} must equal ({p}, {q}) when learn_Psi=True.")
 
-    theta0 = np.array(theta0)
+        base = q * (d + 1)
+        theta_latent = theta0[:base]
+        theta_sigma = theta0[base:]
+        bounds_latent = bounds[:base]
+        bounds_sigma = bounds[base:]
 
-    # include parameters for Sigma eps
-    y_var = Y.var(axis=0, ddof=1)  
-    sigma_eps2_init = np.log(1e-2 * y_var)
-    theta0 = np.concatenate([theta0, sigma_eps2_init])
-
-    # Bounds for Sigma eps 
-    lb = np.maximum(1e-12, 1e-6 * y_var)
-    ub = np.maximum(lb * 10.0, 0.5 * y_var) 
-
-    log_bounds = [(float(np.log(lbi)), float(np.log(ubi))) for lbi, ubi in zip(lb, ub)]
-    bounds.extend(log_bounds)
+        theta0 = np.concatenate([theta_latent, Psi0.ravel(order="C"), theta_sigma])
+        bounds = bounds_latent + [(-5.0, 5.0)] * (p * q) + bounds_sigma
 
     # 5) Fit
     model.fit(
         data={"X_scaled": X_scaled, "y": Y},
         theta0=theta0,
         bounds=bounds,
-        optimizer_opts={"maxiter": 500},
+        optimizer_opts={"maxiter": maxiter},
     )
 
     return model, X, X_scaled, Y
@@ -380,6 +401,7 @@ def plot_forrester_fit_side_by_side(
             p, 2,
             figsize=(13.2, 1.9 * p),  # ~double width of your single-column figure
             sharex=True,
+            sharey="row",
             constrained_layout=True,
         )
         if p == 1:
@@ -402,12 +424,19 @@ def plot_forrester_fit_side_by_side(
         legend_row = min(2, p - 1)
         legend_ax = axes[legend_row, 0]
 
+        # Change training point opacity based number of training points.
+        if X_lhs.shape[0] > 50:
+            alpha = 0.5
+        else:
+            alpha = 0.75
+
+
         for j in range(p):
             # -------- Left column (LHS) --------
             axL = axes[j, 0]
             add_labels_L = False  # keep legend only on the designated axis
 
-            axL.scatter(X_lhs[:, 0], Y_lhs[:, j], s=18, color="black", alpha=0.75, linewidths=0.0,
+            axL.scatter(X_lhs[:, 0], Y_lhs[:, j], s=18, color="black", alpha=alpha, linewidths=0.0,
                         label="Training data" if axL is legend_ax else None, zorder=5)
 
             axL.plot(X_plot[:, 0], Y_true_plot[:, j], color="black", linestyle="-", linewidth=1.6,
@@ -436,7 +465,7 @@ def plot_forrester_fit_side_by_side(
             # -------- Right column (log-LHS) --------
             axR = axes[j, 1]
 
-            axR.scatter(X_log[:, 0], Y_log[:, j], s=18, color="black", alpha=0.75, linewidths=0.0,
+            axR.scatter(X_log[:, 0], Y_log[:, j], s=18, color="black", alpha=alpha, linewidths=0.0,
                         label="Training data" if axR is legend_ax else None, zorder=5)
 
             axR.plot(X_plot[:, 0], Y_true_plot[:, j], color="black", linestyle="-", linewidth=1.6,
@@ -485,8 +514,8 @@ def plot_forrester_fit_side_by_side(
         return fig
 
 def plot_trend_recovery_two_designs(
-    data_lhs, moogp_lhs, mogp_lhs,
-    data_log, moogp_log, mogp_log,
+    data_lhs, moogp_lhs, mogp_lhs=None,
+    data_log=None, moogp_log=None, mogp_log=None,
     output_idx=0,
     n_plot=400,
     left_label="LHS",
@@ -502,7 +531,7 @@ def plot_trend_recovery_two_designs(
       - true function
       - OLS fitted linear trend
       - MOOGP fitted linear trend
-      - MOGP fitted linear trend
+      - MOGP fitted linear trend, if provided
     """
     import matplotlib as mpl
     import matplotlib.pyplot as plt
@@ -526,6 +555,12 @@ def plot_trend_recovery_two_designs(
         "savefig.dpi": 600,
     }
 
+    # Change opacity of training points based on # of observations
+    if data_lhs['X'].shape[0] > 50:
+        pts_alpha = 0.5
+    else:
+        pts_alpha = 1
+
     with mpl.rc_context(paper_rc):
         X_plot = np.linspace(0.0, 1.0, n_plot).reshape(-1, 1)
         y_true = forrester_true_functions(X_plot)[:, output_idx]
@@ -535,17 +570,17 @@ def plot_trend_recovery_two_designs(
         beta_ls_log = get_ols_betas_raw(data_log["X"], data_log["y"])
 
         beta_moogp_lhs = get_model_trend_betas_raw(moogp_lhs)
-        beta_mogp_lhs = get_model_trend_betas_raw(mogp_lhs)
+        beta_mogp_lhs = get_model_trend_betas_raw(mogp_lhs) if mogp_lhs is not None else None
 
         beta_moogp_log = get_model_trend_betas_raw(moogp_log)
-        beta_mogp_log = get_model_trend_betas_raw(mogp_log)
+        beta_mogp_log = get_model_trend_betas_raw(mogp_log) if mogp_log is not None else None
 
         fig, axes = plt.subplots(
             1, 2, figsize=(7.6, 2.8), sharey=True, constrained_layout=True
         )
 
         true_style  = dict(color="black", linestyle="-",  linewidth=2.4)
-        pts_style   = dict(color="black", s=55, zorder=5)
+        pts_style   = dict(color="black", s=55, zorder=5, alpha=pts_alpha)
         ls_style    = dict(color="tab:green", linestyle=":",  linewidth=3.0)
         moogp_style = dict(color="tab:blue",  linestyle="--", linewidth=3.0)
         mogp_style  = dict(color="tab:orange",   linestyle="-",  linewidth=3.0, alpha=0.65)
@@ -591,12 +626,13 @@ def plot_trend_recovery_two_designs(
                 label="MOOGP" if add_labels else None,
                 **moogp_style,
             )
-            ax.plot(
-                X_plot[:, 0],
-                eval_linear_trend(X_plot, beta_mogp, output_idx),
-                label="MOGP" if add_labels else None,
-                **mogp_style,
-            )
+            if beta_mogp is not None:
+                ax.plot(
+                    X_plot[:, 0],
+                    eval_linear_trend(X_plot, beta_mogp, output_idx),
+                    label="MOGP" if add_labels else None,
+                    **mogp_style,
+                )
 
             ax.set_xlabel("Input")
             ax.text(
@@ -993,9 +1029,9 @@ if __name__ == "__main__":
     # ----- Choice Variables -----
     
     # original n_train = 25
-    n_train = 25
+    n_train = 100
     # original seed 67
-    seed = 67
+    seed = 1154
     
     trend_output_idx = 2
 

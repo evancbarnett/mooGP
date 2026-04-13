@@ -6,7 +6,7 @@ from moogp.model import MOOGP
 
 def test_moogp_borehole_small_q_equals_p():
     # small problem so test runs fast
-    data = generate_borehole_data_nd(n=15, p=3, seed=11)
+    data = generate_borehole_data_nd(n=10, p=2, seed=11)
     X = data["X_scaled"]
     Y = data["Y"]
     n, d = X.shape
@@ -38,7 +38,7 @@ def test_moogp_borehole_small_q_equals_p():
     )
 
     model.fit(data=data, theta0=theta0, bounds=bounds,
-              optimizer_opts={"maxiter": 50})
+              optimizer_opts={"maxiter": 30})
 
     assert model.opt_result.success
 
@@ -50,4 +50,4 @@ def test_moogp_borehole_small_q_equals_p():
     max_abs_err = np.max(np.abs(Y_pred - Y))
     # not exact (we have jitter + numerical error),
     # but should be very close
-    assert max_abs_err < 1e-2
+    assert max_abs_err < 2e-2

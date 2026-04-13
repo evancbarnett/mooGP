@@ -2,3 +2,8 @@
 .vscode/
 **/__pycache__/
 .pytest_cache/
+
+AGENTS.md
+.DS_Store
+.venv-oilmm/
+docs/

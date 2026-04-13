@@ -27,12 +27,15 @@ from moogp.datasets import (
 from moogp.evaluation import dss, intervalstats, rmse
 
 
+OPTIMIZER_DIAGNOSTIC_COLUMNS = ("nit", "njev", "nfev")
+
 RESULT_COLUMNS = [
     "run_id",
     "function",
     "method",
     "n",
     "p",
+    "q",
     "rep",
     "seed_data",
     "seed_model",
@@ -40,6 +43,7 @@ RESULT_COLUMNS = [
     "error",
     "train_time_sec",
     "pred_time_sec",
+    *OPTIMIZER_DIAGNOSTIC_COLUMNS,
     "rmse",
     "coverage_95",
     "interval_len_95",
@@ -135,9 +139,51 @@ class FittedPredictor:
     predict_fn: Callable[[np.ndarray], PredictionBundle]
     status: str = "ok"
     error: str = ""
+    train_time_sec: float | None = None
+    nit: int | None = None
+    njev: int | None = None
+    nfev: int | None = None
 
     def predict(self, Xstar: np.ndarray) -> PredictionBundle:
         return self.predict_fn(Xstar)
+
+
+def blank_optimizer_diagnostics() -> dict[str, int | None]:
+    """Return empty optimiser counters for methods that do not expose them."""
+
+    return {name: None for name in OPTIMIZER_DIAGNOSTIC_COLUMNS}
+
+
+def _coerce_optional_int(value: Any) -> int | None:
+    """Best-effort conversion of optimiser counters to plain ints."""
+
+    if value is None:
+        return None
+    if isinstance(value, str) and value == "":
+        return None
+    if isinstance(value, np.generic):
+        value = value.item()
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def extract_optimizer_diagnostics(opt_result: Any) -> dict[str, int | None]:
+    """Extract standard optimiser counters when a backend exposes them."""
+
+    if opt_result is None:
+        return blank_optimizer_diagnostics()
+
+    if isinstance(opt_result, dict):
+        getter = opt_result.get
+    else:
+        getter = lambda name: getattr(opt_result, name, None)
+
+    return {
+        name: _coerce_optional_int(getter(name))
+        for name in OPTIMIZER_DIAGNOSTIC_COLUMNS
+    }
 
 
 def method_python_executable(method: str, config: ExperimentConfig) -> Path | None:
@@ -156,6 +202,12 @@ def stable_seed(*parts: Any) -> int:
     key = "||".join(str(part) for part in parts).encode("utf-8")
     digest = hashlib.blake2b(key, digest_size=8).digest()
     return int.from_bytes(digest, byteorder="big") % (2**32 - 1)
+
+
+def effective_latent_rank(q_requested: int, n: int, p: int) -> int:
+    """Return the latent rank actually used for one benchmark cell."""
+
+    return int(min(q_requested, p, n))
 
 
 def timestamp_utc() -> str:
@@ -344,6 +396,92 @@ def fit_method_local(method: str, bundle: DatasetBundle, seed_model: int, config
     raise ValueError(f"Unsupported method '{method}'. Choices: {SUPPORTED_METHODS}.")
 
 
+def _install_pkg_resources_shim() -> None:
+    """Provide the minimal pkg_resources API that LCGP still imports."""
+
+    try:
+        import pkg_resources  # noqa: F401
+        return
+    except ModuleNotFoundError:
+        pass
+
+    import types
+
+    pkg_resources = types.ModuleType("pkg_resources")
+
+    class DistributionNotFound(Exception):
+        pass
+
+    class _Distribution:
+        def __init__(self, version: str):
+            self.parsed_version = version
+
+    def get_distribution(name: str) -> _Distribution:
+        try:
+            return _Distribution(metadata.version(name))
+        except metadata.PackageNotFoundError as exc:
+            raise DistributionNotFound(str(exc)) from exc
+
+    pkg_resources.get_distribution = get_distribution
+    pkg_resources.DistributionNotFound = DistributionNotFound
+    sys.modules["pkg_resources"] = pkg_resources
+
+
+def _install_plum_parametric_alias() -> None:
+    """Bridge the legacy OILMM import path expected by probmods."""
+
+    try:
+        import plum.parametric  # noqa: F401
+    except ModuleNotFoundError as exc:
+        if exc.name != "plum.parametric":
+            raise
+        import plum._parametric as plum_parametric
+
+        sys.modules["plum.parametric"] = plum_parametric
+
+
+def _install_tensorflow_probability_stub(tf: Any) -> None:
+    """Install the tiny tensorflow_probability surface OILMM needs."""
+
+    if "tensorflow_probability" in sys.modules:
+        return
+
+    import types
+
+    tfp = types.ModuleType("tensorflow_probability")
+    tfp.stats = types.SimpleNamespace(
+        percentile=lambda a, q, axis=None, interpolation="linear": tf.experimental.numpy.percentile(
+            a,
+            q,
+            axis=axis,
+            method=interpolation,
+        )
+    )
+    sys.modules["tensorflow_probability"] = tfp
+
+
+def _get_oilmm_runtime() -> dict[str, Any]:
+    """Load OILMM and its compatibility shims once per interpreter."""
+
+    _install_plum_parametric_alias()
+
+    import tensorflow as tf
+
+    _install_tensorflow_probability_stub(tf)
+
+    from oilmm.tensorflow import OILMM
+    from stheno import EQ, GP
+
+    return {
+        "tf": tf,
+        "dtype": tf.float32,
+        "OILMM": OILMM,
+        "EQ": EQ,
+        "GP": GP,
+        "to_numpy": lambda z: z.numpy() if hasattr(z, "numpy") else np.asarray(z, dtype=float),
+    }
+
+
 def _fit_moogp_like(
     bundle: DatasetBundle,
     seed_model: int,
@@ -351,14 +489,17 @@ def _fit_moogp_like(
     *,
     orthogonal: bool,
 ) -> FittedPredictor:
-    from moogp.model import MOOGP
+    from moogp.model import MOOGP, compute_working_y
 
+    # Exclude import/setup overhead, but include all model work required before predict.
+    train_t0 = time.perf_counter()
     y_train = np.asarray(bundle.train_data["Y"], dtype=float)
     n, d = bundle.train_data["X_scaled"].shape
     p = y_train.shape[1]
-    q_eff = min(config.q, p, n)
-    theta0, bounds = make_latent_theta0_and_bounds(q=q_eff, d=d, seed_model=seed_model)
-    theta0, bounds = append_sigma_eps_theta0_and_bounds(theta0=theta0, bounds=bounds, y_train=y_train)
+    q_eff = effective_latent_rank(config.q, n=n, p=p)
+    # MOOGP now standardizes outputs internally to reduce scale-driven pathologies
+    # in the fast Psi/sigma_eps parameterization. Keep MOGP on the legacy path.
+    standardize_y = "zscore" if orthogonal else False
 
     model = MOOGP(
         terms=[None] + list(range(1, d + 1)),
@@ -372,22 +513,35 @@ def _fit_moogp_like(
         normalize_cols=True,
         use_diagonalized_interaction=config.use_fast,
         use_slow_kyinv=False,
+        standardize_y=standardize_y,
     )
+    fit_data = {"X_scaled": bundle.train_data["X_scaled"], "y": y_train}
+    theta0, bounds = make_latent_theta0_and_bounds(q=q_eff, d=d, seed_model=seed_model)
+    y_work, _, _ = compute_working_y(y_train, model.standardize_y)
+    theta0, bounds = append_sigma_eps_theta0_and_bounds(theta0=theta0, bounds=bounds, y_train=y_work)
     model.fit(
-        data={"X_scaled": bundle.train_data["X_scaled"], "y": y_train},
+        data=fit_data,
         theta0=theta0,
         bounds=bounds,
         optimizer_opts={"maxiter": config.maxiter},
     )
+    train_time_sec = time.perf_counter() - train_t0
 
     status = "ok" if bool(model.opt_result.success) else "opt_failed"
     error = "" if not model.opt_result.message else str(model.opt_result.message)
+    diagnostics = extract_optimizer_diagnostics(model.opt_result)
 
     def _predict(Xstar: np.ndarray) -> PredictionBundle:
         mean, std = model.predict(Xstar, return_std=True)
         return PredictionBundle(mean=np.asarray(mean, dtype=float), std=np.asarray(std, dtype=float))
 
-    return FittedPredictor(predict_fn=_predict, status=status, error=error)
+    return FittedPredictor(
+        predict_fn=_predict,
+        status=status,
+        error=error,
+        train_time_sec=train_time_sec,
+        **diagnostics,
+    )
 
 
 def _fit_lcgp(
@@ -396,34 +550,6 @@ def _fit_lcgp(
     config: ExperimentConfig,
 ) -> FittedPredictor:
     """Fit LCGP using the package's native `(p, n)` output convention."""
-
-    def _install_pkg_resources_shim() -> None:
-        try:
-            import pkg_resources  # noqa: F401
-            return
-        except ModuleNotFoundError:
-            pass
-
-        import types
-
-        pkg_resources = types.ModuleType("pkg_resources")
-
-        class DistributionNotFound(Exception):
-            pass
-
-        class _Distribution:
-            def __init__(self, version: str):
-                self.parsed_version = version
-
-        def get_distribution(name: str) -> _Distribution:
-            try:
-                return _Distribution(metadata.version(name))
-            except metadata.PackageNotFoundError as exc:
-                raise DistributionNotFound(str(exc)) from exc
-
-        pkg_resources.get_distribution = get_distribution
-        pkg_resources.DistributionNotFound = DistributionNotFound
-        sys.modules["pkg_resources"] = pkg_resources
 
     _install_pkg_resources_shim()
 
@@ -441,12 +567,14 @@ def _fit_lcgp(
     np.random.seed(seed_model)
     tf.random.set_seed(seed_model)
 
+    # Keep imports and env shims out of the benchmark timer.
+    train_t0 = time.perf_counter()
     X_train = np.asarray(bundle.train_data["X_scaled"], dtype=float)
     Y_train = np.asarray(bundle.train_data["Y"], dtype=float)
 
     n, _ = X_train.shape
     p = Y_train.shape[1]
-    q_eff = min(config.q, p, n)
+    q_eff = effective_latent_rank(config.q, n=n, p=p)
 
     model = LCGP(
         y=Y_train.T,
@@ -459,9 +587,11 @@ def _fit_lcgp(
         model.trainable_variables,
         options={"maxiter": config.maxiter},
     )
+    train_time_sec = time.perf_counter() - train_t0
 
     status = "ok" if bool(opt_result.success) else "opt_failed"
     error = "" if not opt_result.message else str(opt_result.message)
+    diagnostics = extract_optimizer_diagnostics(opt_result)
 
     def _predict(Xstar: np.ndarray) -> PredictionBundle:
         pred = np.asarray(model.predict(np.asarray(Xstar, dtype=float)))
@@ -476,6 +606,8 @@ def _fit_lcgp(
         predict_fn=_predict,
         status=status,
         error=error,
+        train_time_sec=train_time_sec,
+        **diagnostics,
     )
 
 
@@ -490,34 +622,6 @@ def _fit_oilmm(
     Returns marginal predictive std via PredictionBundle.std.
     Full predictive covariance is not returned here.
     """
-
-    def _install_plum_parametric_alias() -> None:
-        try:
-            import plum.parametric  # noqa: F401
-        except ModuleNotFoundError as exc:
-            if exc.name != "plum.parametric":
-                raise
-            import plum._parametric as plum_parametric
-
-            sys.modules["plum.parametric"] = plum_parametric
-
-    def _install_tensorflow_probability_stub() -> None:
-        if "tensorflow_probability" in sys.modules:
-            return
-
-        import types
-        import tensorflow as tf
-
-        tfp = types.ModuleType("tensorflow_probability")
-        tfp.stats = types.SimpleNamespace(
-            percentile=lambda a, q, axis=None, interpolation="linear": tf.experimental.numpy.percentile(
-                a,
-                q,
-                axis=axis,
-                method=interpolation,
-            )
-        )
-        sys.modules["tensorflow_probability"] = tfp
 
     def _coerce_oilmm_output_shape(arr: np.ndarray, n_rows: int, p: int) -> np.ndarray:
         """
@@ -548,29 +652,34 @@ def _fit_oilmm(
             return X[:, 0]
         return X
 
-    _install_plum_parametric_alias()
+    try:
+        runtime = _get_oilmm_runtime()
+    except ModuleNotFoundError as exc:
+        missing_name = exc.name or "oilmm"
+        raise ModuleNotFoundError(
+            f"OILMM benchmark requires `{missing_name}` in {config.oilmm_python}. "
+            "Install the OILMM benchmark dependencies in the dedicated environment."
+        ) from exc
 
-    import tensorflow as tf
+    OILMM = runtime["OILMM"]
+    EQ = runtime["EQ"]
+    GP = runtime["GP"]
+    dtype = runtime["dtype"]
+    to_numpy = runtime["to_numpy"]
+    tf = runtime["tf"]
 
-    _install_tensorflow_probability_stub()
+    # Match the other TensorFlow-based adapters: seed model initialisation outside timing.
+    np.random.seed(seed_model)
+    tf.random.set_seed(seed_model)
 
-    from oilmm.tensorflow import OILMM
-    from stheno import EQ, GP
-
-
-    backend_name = None
-    to_numpy = None
-
-    dtype = tf.float32
-    backend_name = "tensorflow"
-    to_numpy = lambda z: z.numpy() if hasattr(z, "numpy") else np.asarray(z, dtype=float)
-
+    # The dedicated interpreter absorbs import/shim cost. Time only model work.
+    train_t0 = time.perf_counter()
     X_train = np.asarray(bundle.train_data["X_scaled"], dtype=np.float32)
     Y_train = np.asarray(bundle.train_data["Y"], dtype=np.float32)
 
     n, d = X_train.shape
     p = Y_train.shape[1]
-    q_eff = min(config.q, p, n)
+    q_eff = effective_latent_rank(config.q, n=n, p=p)
 
     X_fit = _oilmm_prepare_X(X_train)
 
@@ -590,11 +699,12 @@ def _fit_oilmm(
     )
 
     fit_kwargs = {"trace": False}
-    if backend_name == "tensorflow":
-        fit_kwargs["jit"] = False
+    fit_kwargs["jit"] = False
+    fit_kwargs["iters"] = config.maxiter
 
     prior.fit(X_fit, Y_train, **fit_kwargs)
     posterior = prior.condition(X_fit, Y_train)
+    train_time_sec = time.perf_counter() - train_t0
 
     def _predict(Xstar: np.ndarray) -> PredictionBundle:
         Xs = _oilmm_prepare_X(np.asarray(Xstar, dtype=np.float32))
@@ -622,6 +732,8 @@ def _fit_oilmm(
         predict_fn=_predict,
         status="ok",
         error="",
+        train_time_sec=train_time_sec,
+        **blank_optimizer_diagnostics(),
     )
 
 
@@ -682,6 +794,7 @@ def make_base_row(
     method: str,
     n: int,
     p: int,
+    q: int,
     rep: int,
     seed_data: int,
     seed_model: int,
@@ -694,6 +807,7 @@ def make_base_row(
         "method": method,
         "n": n,
         "p": p,
+        "q": q,
         "rep": rep,
         "seed_data": seed_data,
         "seed_model": seed_model,
@@ -701,6 +815,7 @@ def make_base_row(
         "error": "",
         "train_time_sec": None,
         "pred_time_sec": None,
+        **blank_optimizer_diagnostics(),
         "rmse": None,
         "coverage_95": None,
         "interval_len_95": None,
@@ -723,24 +838,28 @@ def run_single_method_local(
 
     seed_data = bundle.seed_data
     seed_model = stable_seed(config.base_seed, function, method, n, p, rep, "model")
+    q_eff = effective_latent_rank(config.q, n=n, p=p)
     row = make_base_row(
         run_id=run_id,
         function=function,
         method=method,
         n=n,
         p=p,
+        q=q_eff,
         rep=rep,
         seed_data=seed_data,
         seed_model=seed_model,
     )
 
     try:
-        t0 = time.perf_counter()
         predictor = fit_method_local(method=method, bundle=bundle, seed_model=seed_model, config=config)
-        row["train_time_sec"] = time.perf_counter() - t0
+        row["train_time_sec"] = predictor.train_time_sec
         row["status"] = predictor.status
         row["error"] = predictor.error
+        for key in OPTIMIZER_DIAGNOSTIC_COLUMNS:
+            row[key] = getattr(predictor, key)
 
+        # Only the predict call belongs in pred_time_sec; scoring stays outside.
         t1 = time.perf_counter()
         prediction = predictor.predict(bundle.test_X_scaled)
         row["pred_time_sec"] = time.perf_counter() - t1
@@ -775,12 +894,14 @@ def run_single_method_subprocess(
     """Run one method in its dedicated virtualenv and return the result row."""
 
     seed_model = stable_seed(config.base_seed, function, method, n, p, rep, "model")
+    q_eff = effective_latent_rank(config.q, n=n, p=p)
     row = make_base_row(
         run_id=run_id,
         function=function,
         method=method,
         n=n,
         p=p,
+        q=q_eff,
         rep=rep,
         seed_data=seed_data,
         seed_model=seed_model,
@@ -909,6 +1030,15 @@ def append_results_rows(results_path: Path, rows: list[dict[str, Any]]) -> None:
 
     results_path.parent.mkdir(parents=True, exist_ok=True)
     write_header = not results_path.exists()
+    if not write_header:
+        with results_path.open("r", newline="", encoding="utf-8") as handle:
+            reader = csv.reader(handle)
+            existing_header = next(reader, [])
+        if existing_header != RESULT_COLUMNS:
+            raise ValueError(
+                f"Existing results header in {results_path} does not match the current schema. "
+                "Use a fresh results directory or remove the old results.csv before rerunning."
+            )
     with results_path.open("a", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=RESULT_COLUMNS)
         if write_header:

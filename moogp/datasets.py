@@ -1,3 +1,5 @@
+# moogp/datasets.py
+
 import numpy as np
 from numpy import pi, exp
 from scipy.stats import qmc
@@ -93,11 +95,19 @@ def generate_forrester_data(n, seed=67, with_error=False, error_per_output=None,
     y = np.array([f_1(X), f_2(X), f_3(X)]).squeeze().T
     f = y.copy()
 
-    if with_error and not error_per_output:
-        y += rng.normal(0, 2, size=y.shape)
-
-    if with_error and error_per_output:
-        y += rng.normal(0.0, np.sqrt(error_per_output), size=y.shape)
+    if with_error:
+        if error_per_output is None:
+            raise ValueError(f"Specify error_per_output if with_error = True")
+        else:
+            error_per_output = np.asarray(error_per_output, dtype=float).ravel()
+            if error_per_output.size == 1:
+                error_per_output = np.repeat(error_per_output, y.shape[1])
+            if error_per_output.size != y.shape[1]:
+                raise ValueError(
+                    f"error_per_output length {error_per_output.size} must match the "
+                    f"number of outputs {y.shape[1]}."
+                )
+            y += rng.normal(0.0, np.sqrt(error_per_output), size=y.shape)
 
     X_scaled = to_m1_1(X)
     return {"X": X, "X_scaled": X_scaled, "y": y, "f": f}

@@ -7,7 +7,7 @@ from moogp.model import MOOGP, unpack_theta
 
 def test_learn_psi():
     # Use Forrester toy: 1D input, 3 outputs (nice and small/fast)
-    data = generate_forrester_data(n=25, seed=0)
+    data = generate_forrester_data(n=18, seed=0)
     X = data["X_scaled"]
     Y = data["y"]
     n, d = X.shape
@@ -65,7 +65,7 @@ def test_learn_psi():
         data=data,
         theta0=theta0,
         bounds=bounds,
-        optimizer_opts={"maxiter": 500},
+        optimizer_opts={"maxiter": 150},
     )
 
     assert model.opt_result.success
@@ -87,16 +87,6 @@ def test_learn_psi():
     mean, std = model.predict(X, return_std=True)
     assert mean.shape == Y.shape
     assert std.shape == Y.shape
-    
-    thetanot, psinot, _ = unpack_theta(theta0, d,q,p,learn_Psi=True, learn_sigma_eps=False)
-    thetahat, psihat, _ = unpack_theta(model.theta_hat, d,q,p,learn_Psi=True, learn_sigma_eps=False)
-    
-    print(f"Starting Psi: {psinot}")
-    print(f"Fitted Psi: {psihat}")
 
-    print("\n ")
-    print(f"unpacked matches cached?: {np.allclose(psihat, Psi_hat)}")
-    print("\n ")
-
-    print(f"Starting param values: {thetanot}")
-    print(f"Fitted param values: {thetahat}")
+    _, psihat, _ = unpack_theta(model.theta_hat, d, q, p, learn_Psi=True, learn_sigma_eps=False)
+    assert np.allclose(psihat, Psi_hat)
