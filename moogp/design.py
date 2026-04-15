@@ -1,4 +1,12 @@
+from functools import lru_cache
+
 import numpy as np
+
+
+@lru_cache(maxsize=256)
+def _parse_terms_cached(terms_key, d, one_based, allow_repeated):
+    # Freeze as a tuple so shared cache entries cannot be mutated by callers.
+    return tuple(_parse_terms_impl(list(terms_key), d, one_based, allow_repeated))
 
 
 def parse_terms_to_index_sets(terms, d, one_based=True, allow_repeated=False):
@@ -27,6 +35,16 @@ def parse_terms_to_index_sets(terms, d, one_based=True, allow_repeated=False):
         The intercept maps to ``()``.
     """
 
+    # Try the cached fast path; falls back to the uncached impl if the
+    # caller passed terms containing unhashable entries.
+    try:
+        key = tuple(terms)
+        return _parse_terms_cached(key, int(d), bool(one_based), bool(allow_repeated))
+    except TypeError:
+        return _parse_terms_impl(terms, d, one_based, allow_repeated)
+
+
+def _parse_terms_impl(terms, d, one_based=True, allow_repeated=False):
     J_sets = []
     for t in terms:
         if t is None:

@@ -23,7 +23,7 @@ def ILL_gauss(ell, sigma2=1.0):
          - (sigma2 * (ell**2) / 3.0) * (3.0 - exp(-4.0/(ell**2))) \
          + (2.0 * sqrt(pi) * sigma2 * ell / 3.0) * erf(2.0/ell)
 
-def se_kernel_matrix(X, Xp, ell, sigma2=1.0):
+def se_kernel_matrix(X, Xp, ell, sigma2=1.0, *, sqdist=None):
     """Separable squared-exponential kernel.
 
     Parameters
@@ -34,17 +34,26 @@ def se_kernel_matrix(X, Xp, ell, sigma2=1.0):
         Lengthscales, shape ``(d,)``.
     sigma2 : float
         Marginal variance.
+    sqdist : array_like, optional
+        Precomputed per-coordinate squared differences, shape ``(n, m, d)``,
+        equal to ``(X[:,None,:] - Xp[None,:,:]) ** 2``. When supplied the
+        subtraction is skipped, which also keeps the autograd tape short
+        during optimization (X is a constant).
 
     Returns
     -------
     ndarray
         Kernel matrix shape ``(n,m)``.
     """
-    X = np.asarray(X)
-    Xp = np.asarray(Xp)
-    
-    dif = (X[:, None, :] - Xp[None, :, :]) / ell  # (n, m, d)
-    D2 = np.sum(dif * dif, axis=2)
+    if sqdist is None:
+        X = np.asarray(X)
+        Xp = np.asarray(Xp)
+        diff = X[:, None, :] - Xp[None, :, :]  # (n, m, d)
+        sqdist = diff * diff
+    # Contract the per-coordinate squared differences against 1/ell**2
+    # (broadcasts (n,m,d) * (d,) -> (n,m,d), then sums the d axis).
+    inv_ell2 = 1.0 / (ell * ell)
+    D2 = np.sum(sqdist * inv_ell2, axis=2)
     return sigma2 * np.exp(-D2)
 
 
@@ -77,16 +86,20 @@ def h_matrix_se(X, ell, sigma2, terms, one_based=True):
     """
     X = np.asarray(X)
     n, d = X.shape
-    
+
 
     J_sets = parse_terms_to_index_sets(terms, d, one_based=one_based)
     r = len(J_sets)
     if r == 0:
         return np.empty((n, 0), float)
 
-    # Precompute M_j and L_j for all coords (shape: n×d)
-    M_all = np.column_stack([M_gauss(X[:, j], ell[j], sigma2=1.0) for j in range(d)])
-    L_all = np.column_stack([L_gauss(X[:, j], ell[j], sigma2=1.0) for j in range(d)])
+    # Vectorize M_j and L_j across coordinates in a single call rather than
+    # one scalar-ell call per column. The operations are element-wise, so
+    # broadcasting X (n, d) against ell (d,) produces the same values as the
+    # per-column column_stack but with a dramatically smaller autograd tape.
+    ell_row = np.reshape(ell, (1, d))
+    M_all = M_gauss(X, ell_row, sigma2=1.0)
+    L_all = L_gauss(X, ell_row, sigma2=1.0)
 
     Hcols_list = []
     all_idx = set(range(d))
@@ -148,7 +161,7 @@ def H_diag_se(ell, sigma2, terms, one_based=True):
     return Hdiag * sigma2
 
 
-def make_c_star_matrix(X, Xp, ell, sigma2, terms, orthogonal=True,one_based=True):
+def make_c_star_matrix(X, Xp, ell, sigma2, terms, orthogonal=True, one_based=True, *, sqdist=None):
     """Compute the orthogonalized kernel matrix ``C*(X, X')``.
 
     This is the matrix version of
@@ -165,14 +178,19 @@ def make_c_star_matrix(X, Xp, ell, sigma2, terms, orthogonal=True,one_based=True
 
     J_sets = parse_terms_to_index_sets(terms, d, one_based=one_based)
 
-    # Base covariance
-    C = se_kernel_matrix(X, Xp, ell, sigma2=sigma2)
+    # Base covariance. Thread a precomputed (n,m,d) squared-difference tensor
+    # straight through to keep X, Xp out of the autograd tape when provided.
+    C = se_kernel_matrix(X, Xp, ell, sigma2=sigma2, sqdist=sqdist)
     if (len(J_sets) == 0) or (not orthogonal):
         return C
 
-    # h(X), h(X')
+    # h(X), h(X'). When X and Xp are the same Python object we only need to
+    # evaluate h once instead of recomputing it and the full M/L tape twice.
     hX = h_matrix_se(X, ell, sigma2, terms, one_based=one_based)    # n×r
-    hXp = h_matrix_se(Xp, ell, sigma2, terms, one_based=one_based)  # m×r
+    if Xp is X:
+        hXp = hX
+    else:
+        hXp = h_matrix_se(Xp, ell, sigma2, terms, one_based=one_based)  # m×r
 
     # H diagonal and H^{-1}
     Hdiag = H_diag_se(ell, sigma2, terms, one_based=one_based)

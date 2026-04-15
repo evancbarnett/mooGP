@@ -6,7 +6,7 @@ from scipy.optimize import minimize
 
 from .design import make_G, build_Gy, vecF, unvecF
 from .kernels import make_c_star_matrix, make_c_star_diag
-from autograd import value_and_grad
+from autograd import grad as ag_grad, value_and_grad
 
 def unpack_theta(
     theta_raw,
@@ -275,7 +275,8 @@ class MOOGP:
                  use_diagonalized_interaction=True,
                  use_slow_kyinv=False,
                  store_dense_ky=False,
-                 standardize_y=False):
+                 standardize_y=False,
+                 use_analytical_grad=True):
         """
         Parameters
         ----------
@@ -341,6 +342,7 @@ class MOOGP:
         self.normalize_cols = normalize_cols
         self.use_diagonalized_interaction = bool(use_diagonalized_interaction)
         self.use_slow_kyinv = bool(use_slow_kyinv)
+        self.use_analytical_grad = bool(use_analytical_grad)
         self.store_dense_ky = bool(store_dense_ky)
         self.standardize_y = _normalize_standardize_y_mode(standardize_y)
 
@@ -424,6 +426,13 @@ class MOOGP:
         self.G = make_G({"X_scaled": self.X}, self.terms, one_based=self.one_based, return_names=False)
         self.r = self.G.shape[1] if self.G.size else 0
         self.Gy = build_Gy(self.G, self.p) if self.r > 0 else np.empty((self.n * self.p, 0))
+
+        # Precompute per-coordinate squared differences for the train-train
+        # kernel matrix so autograd does not retrace the (n, n, d) subtraction
+        # each likelihood call (X is constant during optimization).
+        X_np = np.asarray(self.X, dtype=float)
+        diff_train = X_np[:, None, :] - X_np[None, :, :]
+        self._train_sqdist = diff_train * diff_train
 
     def _apply_Ky_inv_fast(self, rhs, info):
         """Apply the diagonalized Woodbury form for ``K_y^{-1}`` to ``rhs``."""
@@ -530,10 +539,13 @@ class MOOGP:
         Gy = self.Gy
 
         # Covariance per latent: Cj_list[k]
+        train_sqdist = getattr(self, "_train_sqdist", None)
         Cj_list = []
         for (sigma2_j, ell_j) in lat_params:
             Cj = make_c_star_matrix(X, X, ell=ell_j, sigma2=sigma2_j,
-                                    terms=terms, orthogonal=self.orthogonal, one_based=self.one_based)
+                                    terms=terms, orthogonal=self.orthogonal,
+                                    one_based=self.one_based,
+                                    sqdist=train_sqdist)
             Cj_list.append(Cj)
 
         fast_diag_info = None
@@ -657,6 +669,152 @@ class MOOGP:
             self.Ky_inv_rvec_ = Ky_inv_rvec
         return nll
     
+    def _nll_and_grad_fast(self, theta_raw):
+        """Exact NLL + analytical gradient on the fast Woodbury path.
+
+        This replaces ``value_and_grad(_nll)`` when the fast path is active and
+        ``use_analytical_grad=True``. It is bit-identical to the autograd
+        gradient up to floating-point roundoff — no approximations.
+
+        Preconditions (enforced by ``fit`` before this method is selected):
+          - ``use_diagonalized_interaction=True``
+          - ``use_slow_kyinv=False``
+          - ``learn_Psi=False`` and ``self.Psi is None`` (so Psi_work is None)
+
+        REML adjustment is left as a placeholder (``A=None``) matching the
+        current ``_nll`` implementation.
+        """
+        X = self.X
+        Y = self.Y
+        n = self.n
+        d = self.d
+        p = self.p
+        q = self.q
+        terms = self.terms
+        orthogonal = self.orthogonal
+        one_based = self.one_based
+        sqdist = getattr(self, "_train_sqdist", None)
+
+        theta_raw = np.asarray(theta_raw, dtype=float)
+
+        # --- Unpack parameters (plain numpy, not traced) ---
+        lat_params, _, sigma_eps2_th = unpack_theta(
+            theta_raw,
+            d,
+            q,
+            p,
+            learn_Psi=False,
+            learn_sigma_eps=self.learn_sigma_eps,
+            normalize_cols=self.normalize_cols,
+        )
+        sigma_eps2 = sigma_eps2_th if self.learn_sigma_eps else self.sigma_eps2_work
+        if sigma_eps2 is None:
+            sigma_eps2 = np.zeros(p, dtype=float)
+        sigma_eps2 = np.maximum(np.asarray(sigma_eps2, dtype=float), self.min_sigma_eps2)
+
+        Phi = self.Phi_fast
+        d_vals = self.d_vals_fast
+        if Phi is None or d_vals is None:
+            raise RuntimeError("Fast-path Phi/d not initialized; call _prepare_data first.")
+        Psi = np.sqrt(sigma_eps2)[:, None] * Phi  # (p, q)
+
+        # --- Build C_k and Cholesky factors (plain numpy, no autograd tape) ---
+        Cj_list = []
+        for (sigma2_j, ell_j) in lat_params:
+            Cj = make_c_star_matrix(
+                X, X,
+                ell=np.asarray(ell_j, dtype=float),
+                sigma2=float(sigma2_j),
+                terms=terms,
+                orthogonal=orthogonal,
+                one_based=one_based,
+                sqdist=sqdist,
+            )
+            Cj_list.append(np.asarray(Cj, dtype=float))
+
+        L_list = []
+        logdetK = float(n) * float(np.sum(np.log(sigma_eps2)))
+        for k in range(q):
+            Ak = np.eye(n) + d_vals[k] * Cj_list[k]
+            Lk = np.linalg.cholesky(Ak)
+            L_list.append(Lk)
+            logdetK += 2.0 * float(np.sum(np.log(np.diag(Lk))))
+
+        # --- Forward pass: apply K_y^{-1} via the existing fast Woodbury helper ---
+        fast_info = dict(
+            n=n,
+            p=p,
+            sigma_eps2=sigma_eps2,
+            latent_factors=[
+                dict(
+                    psi=Phi[:, k] / np.sqrt(sigma_eps2),
+                    d=d_vals[k],
+                    chol=L_list[k],
+                )
+                for k in range(q)
+            ],
+        )
+        solve_Ky = lambda rhs: self._apply_Ky_inv_fast(rhs, fast_info)
+
+        vecY_ = vecF(Y)
+        qf, _bhat, _rvec, Ky_inv_rvec = _profiled_gls_terms(
+            solve_Ky,
+            self.G,
+            self.Gy,
+            vecY_,
+            p,
+            build_cache=True,
+        )
+        nll = 0.5 * (logdetK + qf + (n * p) * np.log(2.0 * np.pi))
+
+        # --- Gradient assembly ---
+        grad_theta = np.zeros_like(theta_raw)
+        alpha_mat = unvecF(Ky_inv_rvec, n, p)  # (n, p)
+
+        # (1) Latent kernel params: autograd on the *scalar* linear functional
+        #     tr(M_k * C_k(theta_k)) with M_k frozen. This produces the exact
+        #     analytical gradient tr(M_k ∂C_k/∂theta_k_i) without tracing
+        #     through Cholesky, solves, or sigma_eps.
+        I_n = np.eye(n)
+        for k in range(q):
+            A_inv = cho_solve((L_list[k], True), I_n, check_finite=False)
+            B_k = d_vals[k] * A_inv
+            g_k = alpha_mat @ Psi[:, k]               # (n,)
+            M_k = 0.5 * (B_k - np.outer(g_k, g_k))    # symmetric (n, n)
+
+            def _tr_Mk_Ck(lat_k_raw, _M=M_k):
+                s2 = np.exp(lat_k_raw[0])
+                ell = np.exp(lat_k_raw[1:1 + d])
+                Ck = make_c_star_matrix(
+                    X, X,
+                    ell=ell,
+                    sigma2=s2,
+                    terms=terms,
+                    orthogonal=orthogonal,
+                    one_based=one_based,
+                    sqdist=sqdist,
+                )
+                return np.sum(_M * Ck)
+
+            theta_k = theta_raw[k * (d + 1):(k + 1) * (d + 1)]
+            grad_k = ag_grad(_tr_Mk_Ck)(theta_k)
+            grad_theta[k * (d + 1):(k + 1) * (d + 1)] = np.asarray(grad_k, dtype=float)
+
+        # (2) Sigma_eps params: fully analytical.
+        #     ∂NLL/∂(log σ²_l) = 0.5 (n - σ²_l ||α_l||² - Σ_k ψ_{k,l} · (α_mat^T C_k g_k)_l)
+        if self.learn_sigma_eps:
+            grad_sigma = 0.5 * (float(n) - sigma_eps2 * np.sum(alpha_mat ** 2, axis=0))
+            for k in range(q):
+                g_k = alpha_mat @ Psi[:, k]           # (n,)
+                Ck_gk = Cj_list[k] @ g_k              # (n,)
+                HA_k = alpha_mat.T @ Ck_gk            # (p,)
+                grad_sigma = grad_sigma - 0.5 * Psi[:, k] * HA_k
+
+            base = q * (d + 1)
+            grad_theta[base:base + p] = grad_sigma
+
+        return float(nll), grad_theta
+
     def fit(self, data, theta0, bounds=None, optimizer_opts=None):
         """
         Fit the model by ML (or REML placeholder) given data and initial hyperparameters.
@@ -683,7 +841,10 @@ class MOOGP:
             and (self.Psi is None)
         )
 
-        if use_fast:
+        if use_fast and self.use_analytical_grad:
+            target_obj = self._nll_and_grad_fast
+            use_jac = True
+        elif use_fast:
             target_obj = value_and_grad(lambda th: self._nll(th, build_cache=False))
             use_jac = True
         else:
