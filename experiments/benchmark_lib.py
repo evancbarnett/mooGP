@@ -497,9 +497,9 @@ def _fit_moogp_like(
     n, d = bundle.train_data["X_scaled"].shape
     p = y_train.shape[1]
     q_eff = effective_latent_rank(config.q, n=n, p=p)
-    # MOOGP now standardizes outputs internally to reduce scale-driven pathologies
-    # in the fast Psi/sigma_eps parameterization. Keep MOGP on the legacy path.
-    standardize_y = "zscore" if orthogonal else False
+    # Both MOOGP and MOGP standardize outputs internally to reduce scale-driven
+    # pathologies in the fast Psi/sigma_eps parameterization.
+    standardize_y = "zscore"
 
     model = MOOGP(
         terms=[None] + list(range(1, d + 1)),

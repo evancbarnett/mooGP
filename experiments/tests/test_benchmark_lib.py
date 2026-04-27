@@ -459,6 +459,65 @@ def test_fit_method_local_moogp_uses_standardized_y_for_sigma_init(tmp_path: Pat
     assert np.allclose(np.std(y_work, axis=0, ddof=1), 1.0, atol=1e-12)
 
 
+def test_fit_method_local_mogp_uses_standardized_y_for_sigma_init(tmp_path: Path, monkeypatch):
+    config = ExperimentConfig(
+        functions=("borehole",),
+        methods=("MOGP",),
+        sample_sizes=(8,),
+        output_dims=(4,),
+        reps=1,
+        n_test=5,
+        q=3,
+        maxiter=5,
+        jitter=1e-6,
+        noise_var_frac=1e-2,
+        use_fast=True,
+        jobs=1,
+        base_seed=123,
+        results_dir=tmp_path,
+    )
+    bundle = build_dataset_bundle(function="borehole", n=8, p=4, n_test=5, seed_data=123)
+
+    captured: dict[str, np.ndarray | str] = {}
+    original_append = benchmark_lib.append_sigma_eps_theta0_and_bounds
+
+    def capture_append(theta0, bounds, y_train):
+        captured["y_train_arg"] = np.asarray(y_train, dtype=float).copy()
+        return original_append(theta0, bounds, y_train)
+
+    captured_models: list[object] = []
+    from moogp.model import MOOGP as _RealMOOGP
+    orig_init = _RealMOOGP.__init__
+
+    def capture_init(self, *init_args, **init_kwargs):
+        orig_init(self, *init_args, **init_kwargs)
+        captured_models.append(self)
+
+    def fake_fit(self, data, theta0, bounds=None, optimizer_opts=None):
+        self.opt_result = SimpleNamespace(success=True, message="")
+        self.fitted = True
+        return self
+
+    def fail_prepare(_self, _data):
+        raise AssertionError("_fit_moogp_like should not call _prepare_data before fit().")
+
+    monkeypatch.setattr(benchmark_lib, "append_sigma_eps_theta0_and_bounds", capture_append)
+    monkeypatch.setattr("moogp.model.MOOGP.__init__", capture_init)
+    monkeypatch.setattr("moogp.model.MOOGP._prepare_data", fail_prepare)
+    monkeypatch.setattr("moogp.model.MOOGP.fit", fake_fit)
+
+    predictor = fit_method_local(method="MOGP", bundle=bundle, seed_model=456, config=config)
+
+    y_work = np.asarray(captured["y_train_arg"], dtype=float)
+    assert predictor.status == "ok"
+    assert len(captured_models) == 1
+    model = captured_models[0]
+    assert model.orthogonal is False
+    assert model.standardize_y == "zscore"
+    assert np.allclose(np.mean(y_work, axis=0), 0.0, atol=1e-12)
+    assert np.allclose(np.std(y_work, axis=0, ddof=1), 1.0, atol=1e-12)
+
+
 def test_fit_method_local_moogp_extracts_optimizer_diagnostics(tmp_path: Path, monkeypatch):
     config = ExperimentConfig(
         functions=("borehole",),
