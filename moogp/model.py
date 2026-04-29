@@ -4,9 +4,21 @@ from autograd.scipy.linalg import solve_triangular as ag_solve_triangular
 from scipy.linalg import cho_factor, cho_solve, solve, solve_triangular
 from scipy.optimize import minimize
 
-from .design import make_G, build_Gy, vecF, unvecF
-from .kernels import make_c_star_matrix, make_c_star_diag
-from autograd import grad as ag_grad, value_and_grad
+from .design import make_G, build_Gy, vecF, unvecF, parse_terms_to_index_sets
+from .kernels import (
+    make_c_star_matrix,
+    make_c_star_diag,
+    se_kernel_matrix,
+    M_gauss,
+    L_gauss,
+    IM_gauss,
+    ILL_gauss,
+    M_dlogell_gauss,
+    L_dlogell_gauss,
+    IM_dlogell_gauss,
+    ILL_dlogell_gauss,
+)
+from autograd import value_and_grad
 
 def unpack_theta(
     theta_raw,
@@ -252,6 +264,276 @@ def _profiled_gls_terms(solve_Ky, G, Gy, vecY, p, *, build_cache):
     rvec = vecY - _block_design_matvec(G, beta_vec, p)
     Ky_inv_rvec = alpha - z @ beta_vec
     return qf, bhat, rvec, Ky_inv_rvec
+
+
+def _profiled_gls_terms_fast(fast_diag_info, G, vecY, alpha_mat, p, *, build_cache):
+    """Fast (Kronecker-structured) profiled GLS terms.
+
+    Equivalent to ``_profiled_gls_terms`` when ``solve_Ky`` is the diagonalized
+    Woodbury form, but exploits ``G_y = I_p ⊗ G`` so we only apply
+    ``Q_k = (I + d_k C_k)^{-1} C_k`` to the (n×r) design ``G``, never to the
+    full (n p × r p) Kronecker block.
+
+    Parameters
+    ----------
+    fast_diag_info : dict
+        Output of the fast-path covariance build (``sigma_eps2``,
+        ``latent_factors``, ``n``, ``p``).
+    G : (n, r) array
+    vecY : (n p,) array
+    alpha_mat : (n, p) array
+        Already-applied ``unvec(K_y^{-1} vec(Y))``.
+    p : int
+    build_cache : bool
+
+    Returns
+    -------
+    qf, bhat, rvec, Ky_inv_rvec
+    """
+    r = G.shape[1] if G.size else 0
+    sigma_eps2 = fast_diag_info["sigma_eps2"]
+    latent_factors = fast_diag_info["latent_factors"]
+
+    alpha = vecF(alpha_mat)
+
+    if r == 0:
+        qf = np.dot(vecY, alpha)
+        if build_cache:
+            return qf, np.zeros((0, p)), vecY, alpha
+        return qf, None, None, None
+
+    # b_gls = G_y^T α = vec(G^T α_mat)
+    b_gls = vecF(G.T @ alpha_mat)
+
+    # W_k = Q_k G   (n × r),     T_k = G^T W_k = G^T Q_k G   (r × r)
+    W_list = []
+    T_list = []
+    for f in latent_factors:
+        W_k = _apply_factorized_qk(f["chol"], f["d"], G)
+        W_list.append(W_k)
+        T_list.append(G.T @ W_k)
+
+    GTG = G.T @ G
+
+    # A_gls = Σ_eps^{-1} ⊗ G^T G  -  Σ_k (ψ̃_k ψ̃_k^T) ⊗ T_k
+    A_gls = np.kron(np.diag(1.0 / sigma_eps2), GTG)
+    for k, T_k in enumerate(T_list):
+        tk = latent_factors[k]["psi"]
+        A_gls = A_gls - np.kron(np.outer(tk, tk), T_k)
+
+    beta_vec = np.linalg.solve(A_gls, b_gls)
+    qf = np.dot(vecY, alpha) - np.dot(b_gls, beta_vec)
+
+    if not build_cache:
+        return qf, None, None, None
+
+    bhat = unvecF(beta_vec, r, p)
+    GB = G @ bhat  # (n, p)
+    rvec = vecY - vecF(GB)
+
+    # K_y^{-1} (G_y β) = vec( G B / σ_eps² - Σ_k W_k (B ψ̃_k) ψ̃_k^T )
+    KyinvGbeta_mat = GB / sigma_eps2[None, :]
+    for k, W_k in enumerate(W_list):
+        tk = latent_factors[k]["psi"]
+        Btk = bhat @ tk  # (r,)
+        Wk_Btk = W_k @ Btk  # (n,)
+        KyinvGbeta_mat = KyinvGbeta_mat - np.outer(Wk_Btk, tk)
+
+    Ky_inv_rvec = alpha - vecF(KyinvGbeta_mat)
+    return qf, bhat, rvec, Ky_inv_rvec
+
+
+def _predict_variance_diag_fast(
+    fast_diag_info,
+    Cj_XsX,
+    psi,
+    *,
+    Cj_diag_star_list,
+    predict_observation,
+):
+    """Diagonal of the predictive covariance via the Woodbury-Kronecker form.
+
+    Computes ``diag(K_** - K_*X K_y^{-1} K_X*)`` (plus measurement noise if
+    requested) without ever forming the dense ``K_*X`` Kronecker block.
+
+    Returns the same column-major (F-order) layout as the dense path:
+    index ``l * n_star + m`` for output ``l`` and test point ``m``.
+
+    Parameters
+    ----------
+    fast_diag_info : dict
+        ``sigma_eps2``, ``latent_factors`` (each with ``chol``, ``d``, ``psi``).
+    Cj_XsX : list of (n_star, n) arrays
+        Per-latent test-train kernel matrices (orthogonalized).
+    psi : (p, q) array
+        Working-scale ψ_j = Σ_eps^{1/2} φ_j (the cached ``Psi``).
+    Cj_diag_star_list : list of (n_star,) arrays
+        Per-latent diagonals of ``C_j(X_*, X_*)``.
+    predict_observation : bool
+        Whether to add ``Σ_eps`` (working-scale) for predictive of an
+        *observation* rather than the mean function.
+    """
+    sigma_eps2 = np.asarray(fast_diag_info["sigma_eps2"], float).ravel()
+    latent_factors = fast_diag_info["latent_factors"]
+    n_star = Cj_XsX[0].shape[0]
+    p, q = psi.shape
+
+    diag = np.zeros(n_star * p)
+    for j in range(q):
+        psi_sq = psi[:, j] ** 2  # (p,)
+        diag = diag + np.kron(psi_sq, Cj_diag_star_list[j])
+
+        chol = latent_factors[j]["chol"]
+        d_j = latent_factors[j]["d"]
+        # S_j = A_j^{-1} C_j(X, X_*)   shape (n, n_*)
+        Sj = cho_solve((chol, True), Cj_XsX[j].T, check_finite=False)
+        # diag(C_j(X_*, X) S_j) = sum_n Cj_XsX[j][m, n] * S_j[n, m]
+        diag_AjCj = np.einsum("mn,nm->m", Cj_XsX[j], Sj)
+        diag = diag - d_j * np.kron(psi_sq, diag_AjCj)
+
+    if predict_observation:
+        diag = diag + np.repeat(sigma_eps2, n_star)
+    return diag
+
+
+def _latent_kernel_logtheta_grad(
+    M_k,
+    X,
+    sqdist,
+    ell,
+    sigma2,
+    terms,
+    *,
+    orthogonal,
+    one_based,
+):
+    """Closed-form ``d/dlog(theta_k) tr(M_k * C*_k(theta_k))`` for one latent.
+
+    Returns a (1 + d,) array
+    ``[d/dlog(sigma2), d/dlog(ell_1), ..., d/dlog(ell_d)]`` matching the
+    packing used by ``_nll_and_grad_fast`` for each latent block.
+
+    Mathematics
+    -----------
+    ``C*_k = sigma2 * (c_0(X,X;ell) - h_0(X;ell) Hd_0(ell)^{-1} h_0(X;ell)^T)``
+    is linear in ``sigma2``, so
+
+        d/dlog(sigma2) tr(M_k C*_k) = tr(M_k C*_k).
+
+    For each coordinate ``c``,
+
+        d/dlog(ell_c) c_k = (2/ell_c^2) * sqdist[:,:,c] * c_k,
+        d/dlog(ell_c) (h_0 Hd_0^{-1} h_0^T) =
+            replace M(x_c, ell_c) with ell_c * dM/dell in the per-term product
+            (resp. L) for h_0; replace IM, ILL similarly for Hd_0.
+
+    Only ``M`` and ``L`` along the c-th coordinate, and ``IM``/``ILL`` at
+    ``ell_c``, depend on ``ell_c`` because the per-coordinate factors are
+    multiplicative and independent across coordinates.
+    """
+    n, d = X.shape
+    sigma2 = float(sigma2)
+    ell = np.asarray(ell, dtype=float).reshape(-1)
+
+    # Bare SE kernel and its log-ell gradient traces.
+    c_se_k = se_kernel_matrix(X, X, ell, sigma2=sigma2, sqdist=sqdist)
+    M_cse = M_k * c_se_k  # (n, n)
+    # tr_se[c] = sum_{i,j} M_k[i,j] * c_se[i,j] * sqdist[i,j,c]
+    tr_se = np.einsum("ij,ijc->c", M_cse, sqdist)
+    grad_logell_se = (2.0 / (ell * ell)) * tr_se  # (d,)
+
+    J_sets = parse_terms_to_index_sets(terms, d, one_based=one_based)
+    do_correction = bool(orthogonal) and (len(J_sets) > 0)
+
+    if not do_correction:
+        # C*_k = c_se_k.  d/dlog(sigma2) tr(M_k C*_k) = tr(M_k c_se_k).
+        grad_logsig = float(np.sum(M_cse))
+        return np.concatenate([[grad_logsig], grad_logell_se])
+
+    # Per-coordinate building blocks (sigma2 = 1 inside the M, L, IM, ILL
+    # factories — sigma2 enters as a single linear multiplier on h, Hd).
+    ell_row = ell.reshape(1, d)
+    M_all = M_gauss(X, ell_row, sigma2=1.0)        # (n, d)
+    L_all = L_gauss(X, ell_row, sigma2=1.0)        # (n, d)
+    dM_all = M_dlogell_gauss(X, ell_row, sigma2=1.0)  # (n, d)
+    dL_all = L_dlogell_gauss(X, ell_row, sigma2=1.0)  # (n, d)
+    IM_arr = np.array([float(IM_gauss(ell[j], sigma2=1.0)) for j in range(d)])
+    ILL_arr = np.array([float(ILL_gauss(ell[j], sigma2=1.0)) for j in range(d)])
+    dIM_arr = np.asarray(IM_dlogell_gauss(ell, sigma2=1.0), dtype=float)
+    dILL_arr = np.asarray(ILL_dlogell_gauss(ell, sigma2=1.0), dtype=float)
+
+    # h_0(X), Hd_0 (sigma2 = 1 versions).
+    r_design = len(J_sets)
+    h0 = np.empty((n, r_design))
+    Hd0 = np.empty(r_design)
+    Ji_indicator = np.zeros((d, r_design), dtype=bool)
+    for i, J_i in enumerate(J_sets):
+        Ji_set = set(J_i)
+        col = np.ones(n)
+        hd = 1.0
+        for j in range(d):
+            in_Ji = j in Ji_set
+            Ji_indicator[j, i] = in_Ji
+            if in_Ji:
+                col = col * L_all[:, j]
+                hd *= ILL_arr[j]
+            else:
+                col = col * M_all[:, j]
+                hd *= IM_arr[j]
+        h0[:, i] = col
+        Hd0[i] = hd
+
+    # h_k = sigma2 * h_0; Hd_k = sigma2 * Hd_0; tr(M_k C_corr_k) is a single
+    # sum that lets us recover ∂/∂log(sigma2) tr(M_k C*_k) = tr(M_k C*_k).
+    h_k = sigma2 * h0
+    Hd_k = sigma2 * Hd0
+    Hi = 1.0 / Hd_k             # (r,)
+
+    Mh = M_k @ h_k              # (n, r)
+    v = np.sum(h_k * Mh, axis=0)  # (r,) = h_k[:,i].T M_k h_k[:,i]
+    tr_M_Ccorr = float(np.sum(Hi * v))
+
+    grad_logsig = float(np.sum(M_cse)) - tr_M_Ccorr  # = tr(M_k C*_k)
+
+    # Per-coordinate ∂tr(M_k C_corr_k)/∂log(ell_c).
+    grad_logell_corr = np.empty(d)
+    for c in range(d):
+        # dh0_c (n, r) = product over j with j == c factor swapped to derivative.
+        dh0_c = np.empty((n, r_design))
+        dHd0_c = np.empty(r_design)
+        for i, _J_i in enumerate(J_sets):
+            col = np.ones(n)
+            hd = 1.0
+            for j in range(d):
+                in_Ji = bool(Ji_indicator[j, i])
+                if j == c:
+                    if in_Ji:
+                        col = col * dL_all[:, j]
+                        hd *= dILL_arr[j]
+                    else:
+                        col = col * dM_all[:, j]
+                        hd *= dIM_arr[j]
+                else:
+                    if in_Ji:
+                        col = col * L_all[:, j]
+                        hd *= ILL_arr[j]
+                    else:
+                        col = col * M_all[:, j]
+                        hd *= IM_arr[j]
+            dh0_c[:, i] = col
+            dHd0_c[i] = hd
+        dh_c = sigma2 * dh0_c
+        dHd_c = sigma2 * dHd0_c
+        # d/dlog(ell_c) [tr(M_k C_corr_k)]
+        #   = sum_i [-Hi_i^2 * dHd_c_i * v_i + 2 * Hi_i * Mh[:,i].T dh_c[:,i]]
+        # M_k is symmetric so the squared form contributes a factor of 2.
+        term1 = -np.sum((Hi * Hi) * dHd_c * v)
+        term2 = 2.0 * np.sum(Hi * np.sum(Mh * dh_c, axis=0))
+        grad_logell_corr[c] = term1 + term2
+
+    grad_logell = grad_logell_se - grad_logell_corr
+    return np.concatenate([[grad_logsig], grad_logell])
+
 
 class MOOGP:
     """
@@ -603,11 +885,16 @@ class MOOGP:
 
         vecY = vecF(Y)
         if use_fast:
-            qf, bhat, rvec, Ky_inv_rvec = _profiled_gls_terms(
-                solve_Ky,
+            # Apply K_y^{-1} to vec(Y) once (single np-vector solve), then use
+            # the Kronecker structure of G_y = I_p ⊗ G to assemble A_gls and
+            # K_y^{-1} G_y β analytically — no dense (np × rp) solve.
+            alpha_vec = self._apply_Ky_inv_fast(vecY, fast_diag_info)
+            alpha_mat = unvecF(alpha_vec, n, p)
+            qf, bhat, rvec, Ky_inv_rvec = _profiled_gls_terms_fast(
+                fast_diag_info,
                 G,
-                Gy,
                 vecY,
+                alpha_mat,
                 p,
                 build_cache=build_cache,
             )
@@ -754,14 +1041,15 @@ class MOOGP:
                 for k in range(q)
             ],
         )
-        solve_Ky = lambda rhs: self._apply_Ky_inv_fast(rhs, fast_info)
-
         vecY_ = vecF(Y)
-        qf, _bhat, _rvec, Ky_inv_rvec = _profiled_gls_terms(
-            solve_Ky,
+        # Single np-vector apply for α; fast path then exploits I_p ⊗ G.
+        alpha_vec = self._apply_Ky_inv_fast(vecY_, fast_info)
+        alpha_mat_for_terms = unvecF(alpha_vec, n, p)
+        qf, _bhat, _rvec, Ky_inv_rvec = _profiled_gls_terms_fast(
+            fast_info,
             self.G,
-            self.Gy,
             vecY_,
+            alpha_mat_for_terms,
             p,
             build_cache=True,
         )
@@ -771,10 +1059,17 @@ class MOOGP:
         grad_theta = np.zeros_like(theta_raw)
         alpha_mat = unvecF(Ky_inv_rvec, n, p)  # (n, p)
 
-        # (1) Latent kernel params: autograd on the *scalar* linear functional
-        #     tr(M_k * C_k(theta_k)) with M_k frozen. This produces the exact
-        #     analytical gradient tr(M_k ∂C_k/∂theta_k_i) without tracing
-        #     through Cholesky, solves, or sigma_eps.
+        # (1) Latent kernel params: closed-form gradient of the trace functional
+        #     tr(M_k * C*_k(theta_k)). C*_k is linear in sigma2 and the
+        #     orthogonalized SE kernel decomposes coordinate-wise, so each
+        #     latent block is assembled from elementary M, L, IM, ILL pieces
+        #     and their log-ell derivatives — no autograd tape, no rebuild of
+        #     the (n × n) kernel under reverse-mode tracing.
+        if sqdist is None:
+            diff = X[:, None, :] - X[None, :, :]
+            sqdist_local = diff * diff
+        else:
+            sqdist_local = sqdist
         I_n = np.eye(n)
         for k in range(q):
             A_inv = cho_solve((L_list[k], True), I_n, check_finite=False)
@@ -782,23 +1077,19 @@ class MOOGP:
             g_k = alpha_mat @ Psi[:, k]               # (n,)
             M_k = 0.5 * (B_k - np.outer(g_k, g_k))    # symmetric (n, n)
 
-            def _tr_Mk_Ck(lat_k_raw, _M=M_k):
-                s2 = np.exp(lat_k_raw[0])
-                ell = np.exp(lat_k_raw[1:1 + d])
-                Ck = make_c_star_matrix(
-                    X, X,
-                    ell=ell,
-                    sigma2=s2,
-                    terms=terms,
-                    orthogonal=orthogonal,
-                    one_based=one_based,
-                    sqdist=sqdist,
-                )
-                return np.sum(_M * Ck)
-
-            theta_k = theta_raw[k * (d + 1):(k + 1) * (d + 1)]
-            grad_k = ag_grad(_tr_Mk_Ck)(theta_k)
-            grad_theta[k * (d + 1):(k + 1) * (d + 1)] = np.asarray(grad_k, dtype=float)
+            sigma2_k = float(lat_params[k][0])
+            ell_k = np.asarray(lat_params[k][1], dtype=float)
+            grad_k = _latent_kernel_logtheta_grad(
+                M_k,
+                X,
+                sqdist_local,
+                ell_k,
+                sigma2_k,
+                terms,
+                orthogonal=orthogonal,
+                one_based=one_based,
+            )
+            grad_theta[k * (d + 1):(k + 1) * (d + 1)] = grad_k
 
         # (2) Sigma_eps params: fully analytical.
         #     ∂NLL/∂(log σ²_l) = 0.5 (n - σ²_l ||α_l||² - Σ_k ψ_{k,l} · (α_mat^T C_k g_k)_l)
@@ -938,36 +1229,60 @@ class MOOGP:
         if not return_std:
             return mean_raw
 
-        # 3. VARIANCE PREDICTION 
-        
-        # We only build this massive matrix if variance is explicitly requested
-        K_XsX = build_cross_K(Psi, Cj_XsX) 
+        # 3. VARIANCE PREDICTION
+        fast_diag_info = cache.get("fast_diag_info")
 
-        # FAST PRIOR VARIANCE: Compute diagonal analytically without building K_XsXs
-        diag_prior = np.zeros(nstar * p)
-        for j, (sigma2_j, ell_j) in enumerate(lat_params):
-            # Compute only diagonal of test-test matrix
-            Cj2_diag = make_c_star_diag(Xs, ell=ell_j, sigma2=sigma2_j,
-                                        terms=terms, orthogonal=self.orthogonal, one_based=one_based)
-            # The diagonal of A kron B is kron(diag(A), diag(B))
-            diag_prior += np.kron(Psi[:, j]**2, Cj2_diag)
+        # Per-latent test-test diagonals are needed by both paths.
+        Cj_diag_star_list = [
+            make_c_star_diag(Xs, ell=ell_j, sigma2=sigma2_j,
+                             terms=terms, orthogonal=self.orthogonal, one_based=one_based)
+            for (sigma2_j, ell_j) in lat_params
+        ]
 
-        # Cross variance and final computation
-        V = self._solve_with_cached_Ky(K_XsX.T)  # (n p × n* p)
-        diag_cross = np.sum(K_XsX * V.T, axis=1)
-        diag = diag_prior - diag_cross
+        if fast_diag_info is not None:
+            # Structure-exploiting: never form the dense K_XsX (np × n*p) block
+            # nor solve K_y^{-1} on it. Use the closed Woodbury form
+            #   K_y^{-1} K_X* = Σ_j (ψ̃_j ψ_j^T) ⊗ A_j^{-1} C_j(X, X_*)
+            # whose diagonal contribution to K_*X K_y^{-1} K_X* is
+            #   Σ_j d_j (ψ_j ⊙ ψ_j) ⊗ diag(C_j(X_*, X) A_j^{-1} C_j(X, X_*)).
+            diag = _predict_variance_diag_fast(
+                fast_diag_info,
+                Cj_XsX,
+                Psi,
+                Cj_diag_star_list=Cj_diag_star_list,
+                predict_observation=bool(predict_observation and sigma_eps2 is not None),
+            )
 
-        if predict_observation and (sigma_eps2 is not None):
-            diag += np.repeat(np.asarray(sigma_eps2, float).ravel(), nstar)
+            if include_mean_uncertainty and Gs.size and use_reml and (A is not None):
+                # Rare REML branch — falls back to the dense form to keep parity.
+                K_XsX = build_cross_K(Psi, Cj_XsX)
+                Gs_y = build_Gy(Gs, p)
+                M = Gs_y - K_XsX @ self._solve_with_cached_Ky(Gy)
+                W = solve(A, M.T, assume_a="sym")
+                diag = diag + np.sum(M * W.T, axis=1)
+        else:
+            # Dense fallback (slow path, e.g. learn_Psi=True or use_slow_kyinv=True).
+            K_XsX = build_cross_K(Psi, Cj_XsX)
 
-        if include_mean_uncertainty and Gs.size and use_reml and (A is not None):
-            Gs_y = build_Gy(Gs, p)
-            M = Gs_y - K_XsX @ self._solve_with_cached_Ky(Gy)
-            W = solve(A, M.T, assume_a="sym")
-            diag += np.sum(M * W.T, axis=1)
+            diag_prior = np.zeros(nstar * p)
+            for j, _ in enumerate(lat_params):
+                diag_prior = diag_prior + np.kron(Psi[:, j] ** 2, Cj_diag_star_list[j])
+
+            V = self._solve_with_cached_Ky(K_XsX.T)
+            diag_cross = np.sum(K_XsX * V.T, axis=1)
+            diag = diag_prior - diag_cross
+
+            if predict_observation and (sigma_eps2 is not None):
+                diag = diag + np.repeat(np.asarray(sigma_eps2, float).ravel(), nstar)
+
+            if include_mean_uncertainty and Gs.size and use_reml and (A is not None):
+                Gs_y = build_Gy(Gs, p)
+                M = Gs_y - K_XsX @ self._solve_with_cached_Ky(Gy)
+                W = solve(A, M.T, assume_a="sym")
+                diag = diag + np.sum(M * W.T, axis=1)
 
         std = np.sqrt(np.maximum(diag, 0.0))
         std = unvecF(std, nstar, p)
         std_raw = self._from_working_std(std)
-        
+
         return mean_raw, std_raw

@@ -145,7 +145,7 @@ def test_experiment_config_round_trips_python_paths(tmp_path: Path):
 def test_method_python_executable_uses_method_specific_interpreters(tmp_path: Path):
     config = ExperimentConfig(
         functions=("borehole",),
-        methods=("MOOGP", "OILMM", "LCGP"),
+        methods=("MOOGP", "OILMM", "LCGP", "PUQ"),
         sample_sizes=(8,),
         output_dims=(3,),
         reps=1,
@@ -160,13 +160,14 @@ def test_method_python_executable_uses_method_specific_interpreters(tmp_path: Pa
         results_dir=tmp_path,
         moogp_python=Path("/tmp/moogp-python"),
         oilmm_python=Path("/tmp/oilmm-python"),
+        puq_python=Path("/tmp/puq-python"),
     )
 
     assert method_python_executable("MOOGP", config) == Path("/tmp/moogp-python")
     assert method_python_executable("MOGP", config) == Path("/tmp/moogp-python")
     assert method_python_executable("LCGP", config) == Path("/tmp/moogp-python")
     assert method_python_executable("OILMM", config) == Path("/tmp/oilmm-python")
-    assert method_python_executable("PUQ", config) is None
+    assert method_python_executable("PUQ", config) == Path("/tmp/puq-python")
 
 
 def test_run_single_method_job_dispatches_oilmm_to_configured_python(tmp_path: Path, monkeypatch):
@@ -387,6 +388,153 @@ def test_fit_method_local_oilmm_uses_benchmark_iteration_budget(tmp_path: Path, 
     assert prediction.mean.shape == bundle.test_Y_true.shape
     assert prediction.std is not None
     assert prediction.std.shape == bundle.test_Y_true.shape
+
+
+def test_fit_method_local_puq_returns_prediction_bundle(tmp_path: Path, monkeypatch):
+    config = ExperimentConfig(
+        functions=("borehole",),
+        methods=("PUQ",),
+        sample_sizes=(8,),
+        output_dims=(3,),
+        reps=1,
+        n_test=5,
+        q=2,
+        maxiter=4,
+        jitter=1e-6,
+        noise_var_frac=1e-2,
+        use_fast=True,
+        jobs=1,
+        base_seed=123,
+        results_dir=tmp_path,
+    )
+    bundle = build_dataset_bundle(function="borehole", n=8, p=3, n_test=5, seed_data=123)
+
+    captured: dict[str, object] = {}
+
+    class FakePUQPrediction:
+        def __init__(self, info):
+            self._info = info
+
+    class FakePUQEmulator:
+        def __init__(self, *, x, theta, f, method, args):
+            captured["x_shape"] = np.asarray(x).shape
+            captured["theta_shape"] = np.asarray(theta).shape
+            captured["f_shape"] = np.asarray(f).shape
+            captured["method"] = method
+            captured["args"] = dict(args)
+            self._x = np.asarray(x, dtype=float)
+            self._p = np.asarray(f).shape[1]
+
+        def predict(self, x, thetaprime=None):
+            captured["thetaprime"] = thetaprime
+            x = np.asarray(x, dtype=float)
+            mean = np.full((self._p, x.shape[0]), 0.5, dtype=float)
+            var = np.full((self._p, x.shape[0]), 0.25, dtype=float)
+            return FakePUQPrediction({"mean": mean, "var": var})
+
+    fake_surrogate = types.ModuleType("PUQ.surrogate")
+    fake_surrogate.emulator = FakePUQEmulator
+    fake_puq_pkg = types.ModuleType("PUQ")
+    monkeypatch.setitem(sys.modules, "PUQ", fake_puq_pkg)
+    monkeypatch.setitem(sys.modules, "PUQ.surrogate", fake_surrogate)
+
+    predictor = fit_method_local(method="PUQ", bundle=bundle, seed_model=456, config=config)
+    prediction = predictor.predict(bundle.test_X_scaled)
+
+    assert predictor.status == "ok"
+    assert predictor.train_time_sec is not None
+    assert predictor.nit is None
+    assert captured["method"] == "multihetGP"
+    assert captured["args"]["maxit"] == config.maxiter
+    assert captured["x_shape"] == bundle.train_data["X_scaled"].shape
+    assert captured["f_shape"] == bundle.train_data["Y"].shape
+    assert captured["theta_shape"][0] == bundle.train_data["Y"].shape[1]
+    assert captured["thetaprime"] is None
+    assert prediction.mean.shape == bundle.test_Y_true.shape
+    assert prediction.std is not None
+    assert prediction.std.shape == bundle.test_Y_true.shape
+    assert prediction.cov is None
+    assert np.all(prediction.std > 0.0)
+
+
+def test_fit_method_local_puq_raises_with_install_hint_when_missing(tmp_path: Path, monkeypatch):
+    config = ExperimentConfig(
+        functions=("borehole",),
+        methods=("PUQ",),
+        sample_sizes=(8,),
+        output_dims=(3,),
+        reps=1,
+        n_test=5,
+        q=2,
+        maxiter=4,
+        jitter=1e-6,
+        noise_var_frac=1e-2,
+        use_fast=True,
+        jobs=1,
+        base_seed=123,
+        results_dir=tmp_path,
+    )
+    bundle = build_dataset_bundle(function="borehole", n=8, p=3, n_test=5, seed_data=123)
+
+    monkeypatch.delitem(sys.modules, "PUQ", raising=False)
+    monkeypatch.delitem(sys.modules, "PUQ.surrogate", raising=False)
+
+    real_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __builtins__.__import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name.startswith("PUQ"):
+            raise ModuleNotFoundError(f"No module named '{name}'", name=name)
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr("builtins.__import__", fake_import)
+
+    with pytest.raises(ModuleNotFoundError) as excinfo:
+        fit_method_local(method="PUQ", bundle=bundle, seed_model=456, config=config)
+
+    message = str(excinfo.value)
+    assert "PUQ" in message
+    assert "pip install" in message
+    assert "hetGPy" in message
+
+
+def test_puq_smoke_fit_and_predict_on_toy_multioutput_dataset(tmp_path: Path):
+    pytest.importorskip("PUQ")
+    pytest.importorskip("hetgpy")
+
+    config = ExperimentConfig(
+        functions=("forrester_mixed",),
+        methods=("PUQ",),
+        sample_sizes=(20,),
+        output_dims=(3,),
+        reps=1,
+        n_test=10,
+        q=2,
+        maxiter=10,
+        jitter=1e-6,
+        noise_var_frac=1e-2,
+        use_fast=True,
+        jobs=1,
+        base_seed=2026,
+        results_dir=tmp_path,
+    )
+    bundle = build_dataset_bundle(
+        function="forrester_mixed",
+        n=20,
+        p=3,
+        n_test=10,
+        seed_data=2026,
+    )
+
+    predictor = fit_method_local(method="PUQ", bundle=bundle, seed_model=2026, config=config)
+    prediction = predictor.predict(bundle.test_X_scaled)
+
+    assert predictor.status == "ok"
+    assert predictor.train_time_sec is not None
+    assert prediction.mean.shape == bundle.test_Y_true.shape
+    assert prediction.std is not None
+    assert prediction.std.shape == bundle.test_Y_true.shape
+    assert np.all(np.isfinite(prediction.mean))
+    assert np.all(prediction.std > 0.0)
 
 
 def test_compute_metrics_accepts_diag_and_full_covariance_shapes():

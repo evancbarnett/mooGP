@@ -7,7 +7,10 @@ python -m experiments.run --functions borehole --methods MOOGP MOGP LCGP --ns 50
 # Larger sweep
 python -m experiments.run --functions borehole forrester_mixed --methods MOOGP MOGP LCGP OILMM PUQ --ns 50 100 250 1000 2500 --ps 10 20 50 --reps 5
 
-# Expected outputs
+# Emit a job list for parallel execution (no benchmark is run; see run_guide.md)
+python -m experiments.run --emit-jobs results/jobs.txt --results-dir results
+
+# Expected outputs (in-process mode)
 results/results.csv
 results/run_metadata.json
 """
@@ -20,9 +23,11 @@ from pathlib import Path
 from .benchmark_lib import (
     DEFAULT_MOOGP_PYTHON,
     DEFAULT_OILMM_PYTHON,
+    DEFAULT_PUQ_PYTHON,
     ExperimentConfig,
     SUPPORTED_FUNCTIONS,
     SUPPORTED_METHODS,
+    emit_job_list,
     run_benchmarks,
 )
 
@@ -131,6 +136,32 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_OILMM_PYTHON,
         help="Python executable used for OILMM runs.",
     )
+    parser.add_argument(
+        "--puq-python",
+        type=Path,
+        default=DEFAULT_PUQ_PYTHON,
+        help="Python executable used for PUQ runs.",
+    )
+    parser.add_argument(
+        "--emit-jobs",
+        type=Path,
+        default=None,
+        help=(
+            "If set, write a per-cell job list to this path and exit instead of "
+            "running the benchmark. Each line is `<run_id> <function> <method> "
+            "<n> <p> <rep>`, designed for `parallel --colsep ' ' ./run_one.sh "
+            "{1} {2} {3} {4} {5} {6} :::: jobs.txt` or AWS Batch array jobs."
+        ),
+    )
+    parser.add_argument(
+        "--jobs-output-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory each per-cell job writes its CSV row into when running "
+            "via run_one.sh. Defaults to <results-dir>/jobs."
+        ),
+    )
     return parser
 
 
@@ -155,7 +186,22 @@ def main() -> int:
         results_dir=args.results_dir,
         moogp_python=args.moogp_python,
         oilmm_python=args.oilmm_python,
+        puq_python=args.puq_python,
     )
+
+    if args.emit_jobs is not None:
+        summary = emit_job_list(
+            config=config,
+            jobs_path=args.emit_jobs,
+            output_dir=args.jobs_output_dir,
+        )
+        print(f"run_id={summary['run_id']}")
+        print(f"config_json={summary['config_path']}")
+        print(f"run_metadata={summary['metadata_path']}")
+        print(f"jobs_file={summary['jobs_path']}")
+        print(f"jobs_output_dir={summary['output_dir']}")
+        print(f"n_jobs={summary['n_jobs']}")
+        return 0
 
     summary = run_benchmarks(config)
     print(f"run_id={summary['run_id']}")

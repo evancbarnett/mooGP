@@ -57,6 +57,16 @@ SUPPORTED_METHODS = ("MOOGP", "MOGP", "LCGP", "OILMM", "PUQ")
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MOOGP_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
 DEFAULT_OILMM_PYTHON = REPO_ROOT / ".venv-oilmm" / "bin" / "python"
+DEFAULT_PUQ_PYTHON = REPO_ROOT / ".venv-puq" / "bin" / "python"
+
+PUQ_INSTALL_HINT = (
+    "PUQ is not installed. Install it (with its hetGPy dependency) into the "
+    "PUQ benchmark environment, e.g.:\n"
+    "    python -m venv .venv-puq && source .venv-puq/bin/activate\n"
+    "    pip install git+https://github.com/davidogara/hetGPy.git\n"
+    "    pip install git+https://github.com/parallelUQ/PUQ.git\n"
+    "See https://github.com/parallelUQ/PUQ for details."
+)
 
 
 @dataclass(frozen=True)
@@ -79,12 +89,14 @@ class ExperimentConfig:
     results_dir: Path
     moogp_python: Path = field(default=DEFAULT_MOOGP_PYTHON)
     oilmm_python: Path = field(default=DEFAULT_OILMM_PYTHON)
+    puq_python: Path = field(default=DEFAULT_PUQ_PYTHON)
 
     def to_metadata(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["results_dir"] = str(self.results_dir)
         payload["moogp_python"] = str(self.moogp_python)
         payload["oilmm_python"] = str(self.oilmm_python)
+        payload["puq_python"] = str(self.puq_python)
         return payload
 
     @classmethod
@@ -106,6 +118,7 @@ class ExperimentConfig:
             results_dir=Path(payload["results_dir"]),
             moogp_python=Path(payload.get("moogp_python", DEFAULT_MOOGP_PYTHON)),
             oilmm_python=Path(payload.get("oilmm_python", DEFAULT_OILMM_PYTHON)),
+            puq_python=Path(payload.get("puq_python", DEFAULT_PUQ_PYTHON)),
         )
 
 
@@ -193,6 +206,8 @@ def method_python_executable(method: str, config: ExperimentConfig) -> Path | No
         return config.moogp_python
     if method == "OILMM":
         return config.oilmm_python
+    if method == "PUQ":
+        return config.puq_python
     return None
 
 
@@ -392,7 +407,7 @@ def fit_method_local(method: str, bundle: DatasetBundle, seed_model: int, config
     if method == "OILMM":
         return _fit_oilmm(bundle=bundle, seed_model=seed_model, config=config)
     if method == "PUQ":
-        return _fit_stub("PUQ")
+        return _fit_puq(bundle=bundle, seed_model=seed_model, config=config)
     raise ValueError(f"Unsupported method '{method}'. Choices: {SUPPORTED_METHODS}.")
 
 
@@ -727,6 +742,76 @@ def _fit_oilmm(
             std=np.sqrt(var_np),
             cov=None,
         )
+
+    return FittedPredictor(
+        predict_fn=_predict,
+        status="ok",
+        error="",
+        train_time_sec=train_time_sec,
+        **blank_optimizer_diagnostics(),
+    )
+
+
+def _fit_puq(
+    bundle: DatasetBundle,
+    seed_model: int,
+    config: ExperimentConfig,
+) -> FittedPredictor:
+    """
+    Fit PUQ's multi-output heteroskedastic GP surrogate (multihetGP).
+
+    PUQ wraps one hetGPy.hetGP per output column, so the predictive distribution
+    is per-output: it provides marginal mean and variance at each test point but
+    no cross-output covariance. We populate PredictionBundle.std and leave .cov
+    as None so dss_full stays blank for this method.
+    """
+
+    try:
+        from PUQ.surrogate import emulator as puq_emulator
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            f"PUQ benchmark requires `{exc.name or 'PUQ'}` in {config.puq_python}. "
+            f"{PUQ_INSTALL_HINT}"
+        ) from exc
+
+    np.random.seed(seed_model)
+
+    # Match the OILMM/LCGP adapters: keep import/shim cost out of the timer,
+    # then time only the model work that includes fitting.
+    train_t0 = time.perf_counter()
+    X_train = np.asarray(bundle.train_data["X_scaled"], dtype=float)
+    Y_train = np.asarray(bundle.train_data["Y"], dtype=float)
+    p = Y_train.shape[1]
+
+    # PUQ's emulator validates `f.shape[1] == theta.shape[0]`; multihetGP itself
+    # never reads `theta`, so a (p, 1) placeholder satisfies the shape check.
+    theta_dummy = np.arange(p, dtype=float).reshape(p, 1)
+
+    emu = puq_emulator(
+        x=X_train,
+        theta=theta_dummy,
+        f=Y_train,
+        method="multihetGP",
+        args={
+            "covtype": "Gaussian",
+            "maxit": int(config.maxiter),
+        },
+    )
+    train_time_sec = time.perf_counter() - train_t0
+
+    def _predict(Xstar: np.ndarray) -> PredictionBundle:
+        Xs = np.asarray(Xstar, dtype=float)
+        # thetaprime=None keeps PUQ from building cross-location covariances we
+        # don't use here.
+        preds = emu.predict(x=Xs, thetaprime=None)
+        mean_pn = np.asarray(preds._info["mean"], dtype=float)
+        var_pn = np.asarray(preds._info["var"], dtype=float)
+        if mean_pn.shape != (p, Xs.shape[0]):
+            raise ValueError(
+                f"Unexpected PUQ prediction shape {mean_pn.shape}; expected {(p, Xs.shape[0])}."
+            )
+        var_pn = np.maximum(var_pn, 1e-12)
+        return PredictionBundle(mean=mean_pn.T, std=np.sqrt(var_pn).T, cov=None)
 
     return FittedPredictor(
         predict_fn=_predict,
@@ -1076,10 +1161,93 @@ def make_run_metadata(run_id: str, config: ExperimentConfig) -> dict[str, Any]:
     }
 
 
+def make_run_id(config: ExperimentConfig) -> str:
+    """Generate a fresh run identifier from base_seed + current timestamp."""
+
+    return f"run_{stable_seed(config.base_seed, timestamp_utc()):010d}"
+
+
+def iter_job_cells(config: ExperimentConfig):
+    """Yield ``(function, method, n, p, rep)`` tuples covering the full grid.
+
+    Used by both the in-process runner and the per-job emission path so the two
+    code paths can never disagree about which cells exist in a sweep.
+    """
+
+    for function in config.functions:
+        for p in config.output_dims:
+            for n in config.sample_sizes:
+                for rep in range(1, config.reps + 1):
+                    for method in config.methods:
+                        yield function, method, n, p, rep
+
+
+def per_job_csv_name(function: str, method: str, n: int, p: int, rep: int) -> str:
+    """Stable per-job CSV filename for parallel sweeps."""
+
+    return f"{function}__{method}__n{n}__p{p}__rep{rep}.csv"
+
+
+def write_single_row_csv(path: Path, row: dict[str, Any]) -> None:
+    """Write one benchmark row to a fresh CSV using the canonical schema."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=RESULT_COLUMNS)
+        writer.writeheader()
+        writer.writerow({key: row.get(key) for key in RESULT_COLUMNS})
+
+
+def emit_job_list(
+    config: ExperimentConfig,
+    jobs_path: Path,
+    output_dir: Path | None = None,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    """Persist config + per-cell job list for parallel execution.
+
+    Writes ``<results_dir>/config.json``, appends ``<results_dir>/run_metadata.json``,
+    and writes ``jobs_path`` with one whitespace-separated line per cell:
+    ``<run_id> <function> <method> <n> <p> <rep>``.
+    """
+
+    if run_id is None:
+        run_id = make_run_id(config)
+    if output_dir is None:
+        output_dir = config.results_dir / "jobs"
+
+    config.results_dir.mkdir(parents=True, exist_ok=True)
+    config_path = config.results_dir / "config.json"
+    with config_path.open("w", encoding="utf-8") as handle:
+        json.dump(config.to_metadata(), handle, indent=2, sort_keys=True)
+
+    metadata_path = config.results_dir / "run_metadata.json"
+    metadata = make_run_metadata(run_id=run_id, config=config)
+    metadata["job_list_path"] = str(jobs_path)
+    metadata["job_output_dir"] = str(output_dir)
+    append_run_metadata(metadata_path, metadata)
+
+    jobs_path.parent.mkdir(parents=True, exist_ok=True)
+    n_jobs = 0
+    with jobs_path.open("w", encoding="utf-8") as handle:
+        for function, method, n, p, rep in iter_job_cells(config):
+            handle.write(f"{run_id} {function} {method} {n} {p} {rep}\n")
+            n_jobs += 1
+
+    return {
+        "run_id": run_id,
+        "config_path": config_path,
+        "metadata_path": metadata_path,
+        "jobs_path": jobs_path,
+        "output_dir": output_dir,
+        "n_jobs": n_jobs,
+    }
+
+
 def run_benchmarks(config: ExperimentConfig) -> dict[str, Any]:
     """Run the full benchmark grid and persist results incrementally."""
 
-    run_id = f"run_{stable_seed(config.base_seed, timestamp_utc()):010d}"
+    run_id = make_run_id(config)
     results_path = config.results_dir / "results.csv"
     metadata_path = config.results_dir / "run_metadata.json"
 
@@ -1088,13 +1256,9 @@ def run_benchmarks(config: ExperimentConfig) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     jobs = max(1, int(config.jobs))
     job_specs = []
-    for function in config.functions:
-        for p in config.output_dims:
-            for n in config.sample_sizes:
-                for rep in range(1, config.reps + 1):
-                    seed_data = stable_seed(config.base_seed, function, n, p, rep, "data")
-                    for method in config.methods:
-                        job_specs.append((run_id, function, method, n, p, rep, seed_data, config))
+    for function, method, n, p, rep in iter_job_cells(config):
+        seed_data = stable_seed(config.base_seed, function, n, p, rep, "data")
+        job_specs.append((run_id, function, method, n, p, rep, seed_data, config))
 
     if jobs == 1:
         for spec in job_specs:

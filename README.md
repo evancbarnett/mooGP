@@ -1,1 +1,1 @@
-# Multi-Output-Ortogonal-GP
+# Multi-Output-Orthogonal-GP

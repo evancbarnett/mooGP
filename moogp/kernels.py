@@ -23,6 +23,54 @@ def ILL_gauss(ell, sigma2=1.0):
          - (sigma2 * (ell**2) / 3.0) * (3.0 - exp(-4.0/(ell**2))) \
          + (2.0 * sqrt(pi) * sigma2 * ell / 3.0) * erf(2.0/ell)
 
+
+# ---------------------------------------------------------------------------
+# Closed-form derivatives w.r.t. log(ell) for the SE building blocks.
+# Used by the analytical fast-path latent-kernel gradient (see
+# ``_nll_and_grad_fast``). Each helper returns ``ell * d/dell`` of its
+# counterpart above; sigma2 enters only as a linear multiplier.
+# ---------------------------------------------------------------------------
+
+
+def M_dlogell_gauss(x, ell, sigma2=1.0):
+    """``ell * dM/dell`` evaluated at ``(x, ell)`` (broadcast like ``M_gauss``)."""
+    x = np.asarray(x)
+    a = x + 1.0
+    b = x - 1.0
+    ALPHA = exp(-(a / ell) ** 2)
+    BETA = exp(-(b / ell) ** 2)
+    M = M_gauss(x, ell, sigma2=1.0)
+    return sigma2 * (M - (a * ALPHA - b * BETA))
+
+
+def L_dlogell_gauss(x, ell, sigma2=1.0):
+    """``ell * dL/dell`` evaluated at ``(x, ell)`` (broadcast like ``L_gauss``)."""
+    x = np.asarray(x)
+    a = x + 1.0
+    b = x - 1.0
+    ALPHA = exp(-(a / ell) ** 2)
+    BETA = exp(-(b / ell) ** 2)
+    M = M_gauss(x, ell, sigma2=1.0)
+    return sigma2 * ((ell * ell) * (ALPHA - BETA) + a * ALPHA + b * BETA + x * M)
+
+
+def IM_dlogell_gauss(ell, sigma2=1.0):
+    """``ell * dIM/dell`` for each entry of ``ell``."""
+    E = exp(-4.0 / (ell * ell))
+    return sigma2 * (2.0 * sqrt(pi) * ell * erf(2.0 / ell) - 2.0 * (ell * ell) * (1.0 - E))
+
+
+def ILL_dlogell_gauss(ell, sigma2=1.0):
+    """``ell * dILL/dell`` for each entry of ``ell``."""
+    ell2 = ell * ell
+    E = exp(-4.0 / ell2)
+    return sigma2 * (
+        (2.0 / 3.0) * ell2 * ell2
+        - 2.0 * ell2
+        + (2.0 * sqrt(pi) * ell / 3.0) * erf(2.0 / ell)
+        - E * (2.0 * ell2 / 3.0) * (ell2 + 1.0)
+    )
+
 def se_kernel_matrix(X, Xp, ell, sigma2=1.0, *, sqdist=None):
     """Separable squared-exponential kernel.
 
