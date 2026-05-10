@@ -2,6 +2,7 @@ import autograd.numpy as np
 
 from autograd.scipy.linalg import solve_triangular as ag_solve_triangular
 from scipy.linalg import cho_factor, cho_solve, solve, solve_triangular
+from scipy.linalg.lapack import dpotri
 from scipy.optimize import minimize
 
 from .design import make_G, build_Gy, vecF, unvecF, parse_terms_to_index_sets
@@ -20,6 +21,84 @@ from .kernels import (
 )
 from autograd import value_and_grad
 
+def normalize_diag_error_structure(diag_error_structure, p):
+    """Validate and normalize a diagonal error grouping spec.
+
+    A grouping specifies how the ``p`` outputs are partitioned into blocks that
+    each share a single ``sigma^2`` parameter, giving
+    ``Sigma_eps = bdiag(sigma_1^2 I_{p1}, ..., sigma_G^2 I_{pG})``.
+
+    ``None`` is interpreted as ``[1] * p`` (no grouping; one parameter per
+    output).
+    """
+    if diag_error_structure is None:
+        return tuple([1] * int(p))
+    sizes = tuple(int(s) for s in diag_error_structure)
+    if any(s <= 0 for s in sizes):
+        raise ValueError(
+            f"diag_error_structure entries must be positive integers; got {diag_error_structure}"
+        )
+    if sum(sizes) != int(p):
+        raise ValueError(
+            f"sum(diag_error_structure)={sum(sizes)} must equal p={p}; got {diag_error_structure}"
+        )
+    return sizes
+
+
+def group_indices_for_outputs(diag_error_structure):
+    """Per-output integer index into a length-G group vector.
+
+    Output ``l`` belongs to group ``group_indices_for_outputs(es)[l]``.  The
+    returned array can be used as ``values_per_group[idx]`` to broadcast a
+    grouped vector to length ``p`` in an autograd-friendly way (autograd's
+    ``np.repeat`` does not accept an array-valued ``repeats`` argument).
+    """
+    sizes = np.asarray(diag_error_structure, dtype=int)
+    out = np.empty(int(sizes.sum()), dtype=int)
+    col = 0
+    for k, sz in enumerate(sizes):
+        out[col:col + int(sz)] = k
+        col += int(sz)
+    return out
+
+
+def expand_grouped_sigma_eps2(values_per_group, diag_error_structure):
+    """Expand a length-G vector of group variances to a length-p per-output vector.
+
+    ``values_per_group[k]`` is broadcast across ``diag_error_structure[k]`` outputs,
+    matching the LCGP ``built_lsigma2s`` construction.
+    """
+    values_per_group = np.asarray(values_per_group)
+    if values_per_group.size != len(diag_error_structure):
+        raise ValueError(
+            f"values_per_group length {values_per_group.size} != number of groups "
+            f"{len(diag_error_structure)}"
+        )
+    idx = group_indices_for_outputs(diag_error_structure)
+    return values_per_group[idx]
+
+
+def aggregate_per_output_to_groups(per_output_values, diag_error_structure):
+    """Sum a length-p per-output vector into a length-G group vector.
+
+    Used when assembling gradients with respect to the grouped log-variance
+    parameters: each group's gradient is the sum of per-output gradients over
+    the outputs in that group.
+    """
+    per_output_values = np.asarray(per_output_values, dtype=float).ravel()
+    if per_output_values.size != int(np.sum(diag_error_structure)):
+        raise ValueError(
+            f"per_output_values length {per_output_values.size} does not match "
+            f"sum(diag_error_structure)={int(np.sum(diag_error_structure))}"
+        )
+    out = np.zeros(len(diag_error_structure), dtype=float)
+    col = 0
+    for k, sz in enumerate(diag_error_structure):
+        out[k] = float(np.sum(per_output_values[col:col + sz]))
+        col += sz
+    return out
+
+
 def unpack_theta(
     theta_raw,
     d,
@@ -29,6 +108,7 @@ def unpack_theta(
     learn_Psi=False,
     learn_sigma_eps=False,
     normalize_cols=True,
+    diag_error_structure=None,
 ):
     """
     Unpack the unconstrained optimization vector
@@ -44,7 +124,11 @@ def unpack_theta(
          => total length q*(d+1)
       2) Optional Psi (if ``learn_Psi=True``): p*q free entries
       3) Optional diagonal measurement noise variances (if ``learn_sigma_eps=True``):
-           [log(sigma^2_{eps,1}), ..., log(sigma^2_{eps,p})]
+           [log(sigma^2_{eps,1}), ..., log(sigma^2_{eps,G})]
+         where G = len(diag_error_structure).  When ``diag_error_structure``
+         is ``None`` the default grouping ``[1] * p`` recovers one log-variance
+         per output (G == p).  The returned ``sigma_eps2`` is always a
+         length-p vector with entries broadcast across each group.
 
     """
      # flatten array to 1d
@@ -56,7 +140,7 @@ def unpack_theta(
     lat = t[:base]
     lat_params = []
     off = 0
-    for j in range(q): 
+    for j in range(q):
         log_s2 = lat[off]
         off += 1
         log_ell = lat[off:off+d]
@@ -81,12 +165,19 @@ def unpack_theta(
 
     sigma_eps2 = None
     if learn_sigma_eps:
-        need = p
+        err_struct = normalize_diag_error_structure(diag_error_structure, p)
+        n_groups = len(err_struct)
+        need = n_groups
         if t.size < off + need:
             raise ValueError(f"theta length {t.size} < required +Sigma_eps {off+need}")
         log_sigma = t[off:off + need]
         off += need
-        sigma_eps2 = np.exp(log_sigma)
+        sigma_grouped = np.exp(log_sigma)
+        # Broadcast each group's variance across its outputs via fancy
+        # indexing. Autograd traces through ``arr[idx]`` cleanly, while
+        # ``np.repeat`` with an array ``repeats`` argument does not.
+        idx = group_indices_for_outputs(err_struct)
+        sigma_eps2 = sigma_grouped[idx]
 
     return lat_params, Psi, sigma_eps2
 
@@ -385,10 +476,12 @@ def _predict_variance_diag_fast(
 
         chol = latent_factors[j]["chol"]
         d_j = latent_factors[j]["d"]
-        # S_j = A_j^{-1} C_j(X, X_*)   shape (n, n_*)
-        Sj = cho_solve((chol, True), Cj_XsX[j].T, check_finite=False)
-        # diag(C_j(X_*, X) S_j) = sum_n Cj_XsX[j][m, n] * S_j[n, m]
-        diag_AjCj = np.einsum("mn,nm->m", Cj_XsX[j], Sj)
+        # diag(C_j(X_*, X) A_j^{-1} C_j(X, X_*))
+        #   = diag( (L^{-1} C_j(X, X_*))^T (L^{-1} C_j(X, X_*)) )
+        # so a single lower-triangular solve plus a column-wise sum-of-squares
+        # replaces the previous solve(L^T, solve(L, C^T)) + einsum(C, S).
+        v = solve_triangular(chol, Cj_XsX[j].T, lower=True, check_finite=False)
+        diag_AjCj = np.einsum("nm,nm->m", v, v)
         diag = diag - d_j * np.kron(psi_sq, diag_AjCj)
 
     if predict_observation:
@@ -549,6 +642,7 @@ class MOOGP:
                  learn_Psi=False,
                  sigma_eps2=None,
                  learn_sigma_eps=None,
+                 diag_error_structure=None,
                  min_sigma_eps2=1e-10,
                  use_reml=False,
                  jitter=1e-6,
@@ -578,6 +672,16 @@ class MOOGP:
             Vector for measurement error
         learn_sigma_eps2: bool
             If True, optimize finds values for diagonal heterogeneous error parameters
+        diag_error_structure: list[int] or None
+            Optional grouping of the ``p`` outputs into blocks that share a
+            single ``sigma^2`` parameter, giving
+            ``Sigma_eps = bdiag(sigma_1^2 I_{p1}, ..., sigma_G^2 I_{pG})``.
+            For example, ``[3, 2, 4]`` requires ``p == 9`` and fits three free
+            variances. ``None`` (the default) is equivalent to ``[1] * p`` and
+            recovers a unique parameter per output. The grouping affects only
+            the parameterization used when ``learn_sigma_eps=True``; the
+            covariance always sees a length-``p`` per-output vector with each
+            group's variance broadcast across its outputs.
         min_sigma_eps2: float
             Minimum value for output measurement error
         use_reml : bool
@@ -614,9 +718,15 @@ class MOOGP:
         
         # If the user doesn't specify, default to learning Sigma_eps when not provided.
         if learn_sigma_eps is None:
-            learn_sigma_eps = (self.sigma_eps2 is None) 
+            learn_sigma_eps = (self.sigma_eps2 is None)
         self.learn_sigma_eps = bool(learn_sigma_eps)
-        
+
+        # Stored as-is; the data-dependent normalization (filling in the
+        # ``[1] * p`` default and verifying ``sum == p``) happens in
+        # ``_prepare_data`` once ``p`` is known.
+        self._diag_error_structure_arg = diag_error_structure
+        self.diag_error_structure = None
+
         self.min_sigma_eps2 = float(min_sigma_eps2)
         self.use_reml = use_reml
         self.jitter = jitter
@@ -698,6 +808,11 @@ class MOOGP:
         if (self.sigma_eps2_work is not None) and (self.sigma_eps2_work.size != p):
             raise ValueError(f"sigma_eps2 length {self.sigma_eps2_work.size} ≠ p={p}")
 
+        # Resolve and validate the diagonal error grouping now that ``p`` is known.
+        self.diag_error_structure = normalize_diag_error_structure(
+            self._diag_error_structure_arg, p
+        )
+
         # Build the fast low-rank basis from the working-scale outputs.
         if self.use_diagonalized_interaction:
             self.Phi_fast, self.d_vals_fast = init_phi(self.Y, self.q, self.n)
@@ -730,12 +845,17 @@ class MOOGP:
         if rhs2.shape[0] != n * p:
             raise ValueError(f"rhs has incompatible leading dimension {rhs2.shape[0]} (expected {n*p}).")
 
-        # Un-vectorize: each RHS column becomes an (n x p) matrix
-        Xrhs = rhs2.reshape(n, p, rhs2.shape[1], order="F")
+        # vecF stacks output columns sequentially, so a C-order reshape to
+        # (p, n, m) gives Xrhs[i, j, k] = V_k[j, i] where V_k is the (n, p)
+        # matrix carrying the k-th rhs. Putting the output dimension first
+        # makes the per-output divide and the latent-projection contraction
+        # operate on contiguous (n, m) slabs.
+        m = rhs2.shape[1]
+        rhs2_c = np.ascontiguousarray(rhs2)
+        Xrhs = rhs2_c.reshape(p, n, m)
 
         # 1. Base measurement noise application: (Sigma_eps^{-1} \otimes I_n)
-        # Broadcasting sigma_eps2 across the n and m dimensions
-        out = Xrhs / sigma_eps2[None, :, None]
+        out = Xrhs / sigma_eps2[:, None, None]
 
         # 2. Subtract latent GP updates. We keep the Cholesky factors of
         # ``I + d_k C_k`` and apply ``Q_k @ rhs`` lazily to avoid caching dense
@@ -745,18 +865,19 @@ class MOOGP:
             d_val = factor["d"]     # scalar
             chol = factor["chol"]   # shape (n, n), lower triangular
 
-            # Step A: Project outputs into the latent space -> shape (n, m)
-            M_uk = np.sum(Xrhs * uk[None, :, None], axis=1)
+            # Step A: project outputs into the latent space -> shape (n, m).
+            M_uk = np.tensordot(uk, Xrhs, axes=(0, 0))
 
-            # Step B: Apply Q_k = (I + d_k C_k)^{-1} C_k via the exact identity
+            # Step B: apply Q_k = (I + d_k C_k)^{-1} C_k via the exact identity
             # Q_k = (I - (I + d_k C_k)^{-1}) / d_k.
             Qk_M_uk = _apply_factorized_qk(chol, d_val, M_uk)
 
-            # Step C: Project back to the output space and subtract -> shape (n, p, m)
-            out = out - (Qk_M_uk[:, None, :] * uk[None, :, None])
+            # Step C: subtract uk[i] * Qk_M_uk[j, k] from out[i, j, k].
+            out = out - uk[:, None, None] * Qk_M_uk[None, :, :]
 
-        # Re-vectorize back to (np, m)
-        out2 = out.reshape(n * p, rhs2.shape[1], order="F")
+        # Re-vectorize back to (np, m) in vecF order: out2[i*n + j, k] = out[i, j, k]
+        # which equals vecF(V_k)[i*n + j].
+        out2 = out.reshape(n * p, m)
         return out2[:, 0] if was_vec else out2
 
     def _solve_with_cached_Ky(self, rhs):
@@ -793,6 +914,7 @@ class MOOGP:
             learn_Psi=self.learn_Psi,
             learn_sigma_eps=self.learn_sigma_eps,
             normalize_cols=self.normalize_cols,
+            diag_error_structure=self.diag_error_structure,
         )
 
         Psi = Psi_th if self.learn_Psi else self.Psi_work
@@ -952,6 +1074,7 @@ class MOOGP:
                 y_center=self.y_center_,
                 y_scale=self.y_scale_,
                 standardize_y=self.standardize_y,
+                theta_raw=np.asarray(theta_raw, dtype=float).copy(),
             )
             self.Ky_inv_rvec_ = Ky_inv_rvec
         return nll
@@ -993,6 +1116,7 @@ class MOOGP:
             learn_Psi=False,
             learn_sigma_eps=self.learn_sigma_eps,
             normalize_cols=self.normalize_cols,
+            diag_error_structure=self.diag_error_structure,
         )
         sigma_eps2 = sigma_eps2_th if self.learn_sigma_eps else self.sigma_eps2_work
         if sigma_eps2 is None:
@@ -1045,7 +1169,7 @@ class MOOGP:
         # Single np-vector apply for α; fast path then exploits I_p ⊗ G.
         alpha_vec = self._apply_Ky_inv_fast(vecY_, fast_info)
         alpha_mat_for_terms = unvecF(alpha_vec, n, p)
-        qf, _bhat, _rvec, Ky_inv_rvec = _profiled_gls_terms_fast(
+        qf, bhat, rvec, Ky_inv_rvec = _profiled_gls_terms_fast(
             fast_info,
             self.G,
             vecY_,
@@ -1054,6 +1178,41 @@ class MOOGP:
             build_cache=True,
         )
         nll = 0.5 * (logdetK + qf + (n * p) * np.log(2.0 * np.pi))
+
+        # Populate the prediction cache so ``fit`` does not need a separate
+        # post-optimization ``_nll`` rebuild. The fields mirror what ``_nll``
+        # writes on the fast path.
+        self.cache = dict(
+            Ky=None,
+            Ky_chol=None,
+            Cj_list=Cj_list,
+            Psi=Psi,
+            Psi_raw=self._psi_from_working_scale(Psi),
+            sigma_eps2=sigma_eps2,
+            sigma_eps2_raw=self._sigma_eps2_from_working_scale(sigma_eps2),
+            used_fast=True,
+            fast_diag_info=fast_info,
+            G=self.G,
+            Gy=self.Gy,
+            bhat=bhat,
+            r_vec=rvec,
+            Ky_inv_rvec=Ky_inv_rvec,
+            residual_vec=rvec,
+            qf=qf,
+            logdetK=logdetK,
+            A=None,
+            lat_params=lat_params,
+            terms=terms,
+            one_based=one_based,
+            X=X,
+            Y=Y,
+            Y_raw=self.Y_raw,
+            y_center=self.y_center_,
+            y_scale=self.y_scale_,
+            standardize_y=self.standardize_y,
+            theta_raw=theta_raw.copy(),
+        )
+        self.Ky_inv_rvec_ = Ky_inv_rvec
 
         # --- Gradient assembly ---
         grad_theta = np.zeros_like(theta_raw)
@@ -1070,10 +1229,18 @@ class MOOGP:
             sqdist_local = diff * diff
         else:
             sqdist_local = sqdist
-        I_n = np.eye(n)
         for k in range(q):
-            A_inv = cho_solve((L_list[k], True), I_n, check_finite=False)
-            B_k = d_vals[k] * A_inv
+            # dpotri exploits symmetry of A^{-1} and is ~2x faster than
+            # cho_solve(L, I_n) at the cost of returning only one triangle.
+            # Pass a copy of L so dpotri's overwrite does not corrupt L_list[k]
+            # (still needed by _apply_Ky_inv_fast and the cache).
+            A_inv_lo, info_inv = dpotri(L_list[k], lower=1, overwrite_c=0)
+            if info_inv != 0:
+                raise RuntimeError(f"dpotri failed for latent {k} (info={info_inv})")
+            # Mirror the lower triangle into the upper triangle in-place.
+            i_hi = np.triu_indices(n, k=1)
+            A_inv_lo[i_hi] = A_inv_lo.T[i_hi]
+            B_k = d_vals[k] * A_inv_lo
             g_k = alpha_mat @ Psi[:, k]               # (n,)
             M_k = 0.5 * (B_k - np.outer(g_k, g_k))    # symmetric (n, n)
 
@@ -1093,16 +1260,23 @@ class MOOGP:
 
         # (2) Sigma_eps params: fully analytical.
         #     ∂NLL/∂(log σ²_l) = 0.5 (n - σ²_l ||α_l||² - Σ_k ψ_{k,l} · (α_mat^T C_k g_k)_l)
+        # When ``diag_error_structure`` groups outputs, the free parameter is
+        # ``log σ²_g`` shared across the outputs in group g; by the chain rule
+        # the group gradient is the sum of per-output gradients in that group.
         if self.learn_sigma_eps:
-            grad_sigma = 0.5 * (float(n) - sigma_eps2 * np.sum(alpha_mat ** 2, axis=0))
+            grad_sigma_per_output = 0.5 * (float(n) - sigma_eps2 * np.sum(alpha_mat ** 2, axis=0))
             for k in range(q):
                 g_k = alpha_mat @ Psi[:, k]           # (n,)
                 Ck_gk = Cj_list[k] @ g_k              # (n,)
                 HA_k = alpha_mat.T @ Ck_gk            # (p,)
-                grad_sigma = grad_sigma - 0.5 * Psi[:, k] * HA_k
+                grad_sigma_per_output = grad_sigma_per_output - 0.5 * Psi[:, k] * HA_k
+
+            err_struct = self.diag_error_structure
+            grad_sigma = aggregate_per_output_to_groups(grad_sigma_per_output, err_struct)
+            n_groups = len(err_struct)
 
             base = q * (d + 1)
-            grad_theta[base:base + p] = grad_sigma
+            grad_theta[base:base + n_groups] = grad_sigma
 
         return float(nll), grad_theta
 
@@ -1157,8 +1331,12 @@ class MOOGP:
         self.opt_result = res
         self.fitted = True
 
-        # Make sure cache corresponds to theta_hat
-        self._nll(self.theta_hat)
+        # Skip the post-fit rebuild when the optimizer's last evaluation already
+        # populated ``self.cache`` for ``theta_hat``. ``_nll_and_grad_fast`` and
+        # ``_nll(build_cache=True)`` both stamp ``theta_raw`` on the cache.
+        cache_theta = (self.cache or {}).get("theta_raw") if self.cache else None
+        if cache_theta is None or not np.array_equal(np.asarray(cache_theta), np.asarray(self.theta_hat)):
+            self._nll(self.theta_hat)
         return self
     
     def predict(
