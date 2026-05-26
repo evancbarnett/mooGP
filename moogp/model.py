@@ -299,6 +299,60 @@ def compute_working_y(Y, standardize_y):
     return Y_work, center, scale
 
 
+def _normalize_standardize_x_mode(standardize_x):
+    """Normalize user-facing input-standardization options."""
+    if standardize_x in (False, None):
+        return False
+    if standardize_x is True:
+        return "unitcube"
+    if isinstance(standardize_x, str):
+        mode = standardize_x.lower()
+        if mode in {"unitcube"}:
+            return mode
+    raise ValueError("standardize_x must be one of False, True, or 'unitcube'.")
+
+
+def _compute_x_center_scale(X, mode, margin=0.0):
+    """Return per-dim center / half-width for the model's internal X scale.
+
+    ``margin`` is a non-negative multiplicative padding applied in unit-cube
+    mode: the working half-width becomes ``(1 + margin) * (x_max - x_min) / 2``,
+    so training X lands in ``[-1/(1+margin), 1/(1+margin)]`` instead of exactly
+    on ``[-1, 1]``. This leaves headroom for test points whose coordinates
+    fall slightly outside the training range and keeps gradient evaluations
+    away from the corners of the cube where the kernel has zero curvature.
+    """
+    X = np.asarray(X, float)
+    d = X.shape[1]
+
+    if mode is False:
+        return np.zeros(d, dtype=float), np.ones(d, dtype=float)
+
+    if mode == "unitcube":
+        margin = float(margin)
+        if margin < 0.0:
+            raise ValueError(f"x margin must be non-negative; got {margin}.")
+        x_min = np.min(X, axis=0)
+        x_max = np.max(X, axis=0)
+        center = 0.5 * (x_min + x_max)
+        half_width = 0.5 * (x_max - x_min) * (1.0 + margin)
+        # Constant columns can't be rescaled to [-1, 1]; leave them at the
+        # center (X_work = 0) by setting scale = 1.
+        half_width = np.where(half_width > 1e-12, half_width, 1.0)
+        return center, half_width
+
+    # pragma: no cover - guarded by _normalize_standardize_x_mode
+    raise ValueError(f"Unsupported standardize_x mode: {mode}")
+
+
+def compute_working_x(X, standardize_x, margin=0.0):
+    """Project raw inputs onto the model's internal working scale."""
+    mode = _normalize_standardize_x_mode(standardize_x)
+    center, scale = _compute_x_center_scale(X, mode, margin=margin)
+    X_work = (np.asarray(X, float) - center[None, :]) / scale[None, :]
+    return X_work, center, scale
+
+
 def _solve_spd_from_cholesky(chol, rhs):
     """Solve ``A x = rhs`` given a lower-triangular Cholesky factor of ``A``."""
     y = ag_solve_triangular(chol, rhs, lower=True)
@@ -651,7 +705,9 @@ class MOOGP:
                  use_diagonalized_interaction=True,
                  use_slow_kyinv=False,
                  store_dense_ky=False,
-                 standardize_y=False,
+                 standardize_y="zscore",
+                 standardize_x="unitcube",
+                 x_margin=0.1,
                  use_analytical_grad=True):
         """
         Parameters
@@ -704,10 +760,30 @@ class MOOGP:
         store_dense_ky : bool
             If True, keep dense ``Ky`` in cache for debugging.
         standardize_y : bool | str
-            Optional output standardization applied internally before fitting.
-            Supported values are ``False``, ``True``/``"zscore"``, and
-            ``"robust"``. Predictions are always returned on the original
-            output scale.
+            Output standardization applied internally before fitting. Default
+            ``"zscore"``. Supported values are ``False`` (no scaling),
+            ``True``/``"zscore"`` (per-output mean / sample-std), and
+            ``"robust"`` (median / MAD). Predictions are always returned on the
+            original output scale.
+        standardize_x : bool | str
+            Input standardization applied internally before fitting. Default
+            ``"unitcube"`` (per-dim mapping to ``[-1, 1]`` using the training
+            min/max) — the kernel theory and the default length-scale bounds
+            assume X lives on the unit cube. Pass ``False`` to disable the
+            transform when X is already on the right scale. When enabled the
+            same transform is applied to ``Xstar`` at predict time, so callers
+            can pass raw, unscaled X to both ``fit`` and ``predict``.
+        x_margin : float
+            Non-negative multiplicative padding for ``standardize_x="unitcube"``.
+            With ``x_margin = m`` the per-dim half-width is widened by
+            ``(1 + m)``, so training points land in
+            ``[-1/(1+m), 1/(1+m)]`` instead of exactly on the cube boundary.
+            Useful when test inputs may fall slightly outside the training
+            range and to keep the optimizer away from the corners of the cube
+            where the kernel has zero curvature. Default ``0.1`` — calibrated
+            on the VAH fold-1 margin sweep (see
+            ``notebooks/vah_moogp_diagnostic.ipynb``). Ignored when
+            ``standardize_x`` is disabled.
         """
         self.terms = terms
         self.q = q
@@ -737,6 +813,10 @@ class MOOGP:
         self.use_analytical_grad = bool(use_analytical_grad)
         self.store_dense_ky = bool(store_dense_ky)
         self.standardize_y = _normalize_standardize_y_mode(standardize_y)
+        self.standardize_x = _normalize_standardize_x_mode(standardize_x)
+        self.x_margin = float(x_margin)
+        if self.x_margin < 0.0:
+            raise ValueError(f"x_margin must be non-negative; got {self.x_margin}.")
 
         self._data = None
         self.cache = None
@@ -748,8 +828,14 @@ class MOOGP:
         self.Y_raw = None
         self.y_center_ = None
         self.y_scale_ = None
+        self.X_raw = None
+        self.x_center_ = None
+        self.x_scale_ = None
         self.Psi_work = None
         self.sigma_eps2_work = None
+
+    def _to_working_x(self, X):
+        return (np.asarray(X, float) - self.x_center_[None, :]) / self.x_scale_[None, :]
 
     def _to_working_y(self, Y):
         return (np.asarray(Y, float) - self.y_center_[None, :]) / self.y_scale_[None, :]
@@ -783,15 +869,24 @@ class MOOGP:
         return sigma_eps2 * (self.y_scale_ ** 2)
     
     def _prepare_data(self, data):
-        X = np.asarray(data["X_scaled"])
+        # Accept both legacy ``X_scaled`` and the more honest ``X`` key; if both
+        # are present we prefer the raw ``X`` so callers can migrate cleanly.
+        if "X" in data:
+            X_raw = np.asarray(data["X"])
+        else:
+            X_raw = np.asarray(data["X_scaled"])
         Y_raw = np.asarray(data.get("Y", data.get("y")))
-        n, d = X.shape
+        n, d = X_raw.shape
         p = Y_raw.shape[1]
 
+        X, self.x_center_, self.x_scale_ = compute_working_x(
+            X_raw, self.standardize_x, margin=self.x_margin,
+        )
         Y, self.y_center_, self.y_scale_ = compute_working_y(Y_raw, self.standardize_y)
 
         self._data = data
         self.X = X
+        self.X_raw = X_raw
         self.Y = Y
         self.Y_raw = Y_raw
         self.n = n
@@ -1349,7 +1444,12 @@ class MOOGP:
         predict_observation=True,
     ):
         """
-        Predict at new inputs Xstar (scaled in [-1,1]^d).
+        Predict at new inputs ``Xstar``.
+
+        ``Xstar`` should be on the same scale as the X the model was fit on:
+        raw when ``standardize_x`` is set (the model applies its training-data
+        ``[-1, 1]`` map to ``Xstar`` here), and already in ``[-1, 1]`` when
+        ``standardize_x=False`` (the historical convention).
 
         Returns
         -------
@@ -1376,7 +1476,7 @@ class MOOGP:
         p = Psi.shape[0]
         Ky_inv_rvec = cache["Ky_inv_rvec"]
 
-        Xs = np.asarray(Xstar)
+        Xs = self._to_working_x(np.asarray(Xstar))
         nstar = Xs.shape[0]
 
         # 1. Evaluate spatial cross-kernels
