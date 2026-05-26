@@ -24,7 +24,7 @@ from moogp.datasets import (
     generate_forrester_data,
     tstd2theta,
 )
-from moogp.evaluation import dss, intervalstats, rmse
+from moogp.evaluation import dss, intervalstats, normalized_rmse, rmse
 
 
 OPTIMIZER_DIAGNOSTIC_COLUMNS = ("nit", "njev", "nfev")
@@ -34,6 +34,7 @@ RESULT_COLUMNS = [
     "function",
     "method",
     "n",
+    "n_train",
     "p",
     "q",
     "rep",
@@ -45,19 +46,35 @@ RESULT_COLUMNS = [
     "pred_time_sec",
     *OPTIMIZER_DIAGNOSTIC_COLUMNS,
     "rmse",
+    "normalized_rmse",
+    "train_rmse",
+    "train_normalized_rmse",
     "coverage_95",
     "interval_len_95",
     "dss_diag",
     "dss_full",
+    "n_folds",
 ]
 
-SUPPORTED_FUNCTIONS = ("borehole", "forrester_mixed")
+SUPPORTED_FUNCTIONS = ("borehole", "forrester_mixed", "vah_nuclear")
 SUPPORTED_METHODS = ("MOOGP", "MOGP", "LCGP", "OILMM", "PUQ")
+VAH_GROUPING_CHOICES = ("index", "none")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MOOGP_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
 DEFAULT_OILMM_PYTHON = REPO_ROOT / ".venv-oilmm" / "bin" / "python"
 DEFAULT_PUQ_PYTHON = REPO_ROOT / ".venv-puq" / "bin" / "python"
+
+# The VAH dataset ships at a fixed shape; the values here must match
+# moogp/nuclear_data/all_theta.csv and all_f.csv. They are validated against the
+# files at load time in `_load_vah_arrays`.
+VAH_DATA_DIR = REPO_ROOT / "moogp" / "nuclear_data"
+VAH_THETA_PATH = VAH_DATA_DIR / "all_theta.csv"
+VAH_F_PATH = VAH_DATA_DIR / "all_f.csv"
+VAH_INDEX_PATH = VAH_DATA_DIR / "all_f_index.csv"
+VAH_TOTAL_N = 541
+VAH_D = 15
+VAH_P = 98
 
 PUQ_INSTALL_HINT = (
     "PUQ is not installed. Install it (with its hetGPy dependency) into the "
@@ -90,6 +107,8 @@ class ExperimentConfig:
     moogp_python: Path = field(default=DEFAULT_MOOGP_PYTHON)
     oilmm_python: Path = field(default=DEFAULT_OILMM_PYTHON)
     puq_python: Path = field(default=DEFAULT_PUQ_PYTHON)
+    n_folds: int = 5
+    vah_grouping: str = "index"
 
     def to_metadata(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -119,6 +138,8 @@ class ExperimentConfig:
             moogp_python=Path(payload.get("moogp_python", DEFAULT_MOOGP_PYTHON)),
             oilmm_python=Path(payload.get("oilmm_python", DEFAULT_OILMM_PYTHON)),
             puq_python=Path(payload.get("puq_python", DEFAULT_PUQ_PYTHON)),
+            n_folds=int(payload.get("n_folds", 5)),
+            vah_grouping=str(payload.get("vah_grouping", "index")),
         )
 
 
@@ -238,6 +259,11 @@ def build_dataset_bundle(
     n_test: int,
     seed_data: int,
     noise_var_frac: float = 1e-2,
+    *,
+    rep: int = 1,
+    n_folds: int = 5,
+    vah_grouping: str = "index",
+    base_seed: int = 0,
 ) -> DatasetBundle:
     """Build one deterministic train/test dataset for a benchmark cell."""
 
@@ -245,6 +271,13 @@ def build_dataset_bundle(
         return _build_borehole_bundle(n=n, p=p, n_test=n_test, seed_data=seed_data, noise_var_frac=noise_var_frac)
     if function == "forrester_mixed":
         return _build_forrester_bundle(n=n, p=p, n_test=n_test, seed_data=seed_data, noise_var_frac=noise_var_frac)
+    if function == "vah_nuclear":
+        return _build_vah_bundle(
+            rep=rep,
+            n_folds=n_folds,
+            vah_grouping=vah_grouping,
+            base_seed=base_seed,
+        )
     raise ValueError(f"Unsupported function '{function}'. Choices: {SUPPORTED_FUNCTIONS}.")
 
 
@@ -363,6 +396,142 @@ def _build_forrester_bundle(
     )
 
 
+def _load_vah_arrays() -> tuple[np.ndarray, np.ndarray]:
+    """Load the headerless VAH design and output matrices and shape-check them."""
+
+    theta = np.loadtxt(VAH_THETA_PATH, delimiter=",", dtype=float)
+    f = np.loadtxt(VAH_F_PATH, delimiter=",", dtype=float)
+    if theta.ndim != 2 or theta.shape[1] != VAH_D:
+        raise ValueError(
+            f"all_theta.csv has shape {theta.shape}; expected (*, {VAH_D})."
+        )
+    if f.ndim != 2 or f.shape[1] != VAH_P:
+        raise ValueError(
+            f"all_f.csv has shape {f.shape}; expected (*, {VAH_P})."
+        )
+    if theta.shape[0] != f.shape[0]:
+        raise ValueError(
+            f"all_theta.csv ({theta.shape[0]} rows) and all_f.csv "
+            f"({f.shape[0]} rows) have mismatched row counts."
+        )
+    return theta, f
+
+
+def _load_vah_diag_error_structure(expected_p: int = VAH_P) -> list[int]:
+    """Parse `all_f_index.csv` into the diagonal grouping for the kept outputs.
+
+    Skips lines whose group name is empty or that contain `# omitted`, so the
+    `pT_fluct` block (referenced in the index file but absent from `all_f.csv`)
+    is dropped while every other group keeps its full width.
+    """
+
+    widths: list[int] = []
+    with VAH_INDEX_PATH.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            text = line.strip()
+            if not text or "# omitted" in text.lower():
+                continue
+            parts = text.split(",")
+            if len(parts) < 3:
+                continue
+            name = parts[0].strip()
+            if not name:
+                continue
+            try:
+                start = int(parts[1].strip())
+                stop = int(parts[2].split("#")[0].strip())
+            except ValueError:
+                continue
+            widths.append(stop - start)
+    total = sum(widths)
+    if total != expected_p:
+        raise ValueError(
+            f"VAH grouping widths sum to {total} but expected {expected_p}; "
+            f"check {VAH_INDEX_PATH}."
+        )
+    return widths
+
+
+def _kfold_indices(n_total: int, n_folds: int, seed: int) -> list[np.ndarray]:
+    """Return a deterministic shuffled k-fold partition of `range(n_total)`.
+
+    The split depends only on (`n_total`, `n_folds`, `seed`), so every cell in a
+    sweep sees the same fold assignment regardless of which rep it processes.
+    """
+
+    if n_folds < 2:
+        raise ValueError(f"n_folds must be >= 2, got {n_folds}.")
+    if n_total < n_folds:
+        raise ValueError(f"n_total={n_total} < n_folds={n_folds}.")
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(n_total)
+    return [np.sort(part) for part in np.array_split(perm, n_folds)]
+
+
+def _build_vah_bundle(
+    rep: int,
+    n_folds: int,
+    vah_grouping: str,
+    base_seed: int,
+) -> DatasetBundle:
+    """K-fold CV bundle for the VAH dataset.
+
+    The bundle ships **raw** simulator inputs and outputs — each method is
+    responsible for its own standardization. MOOGP/MOGP read
+    ``extra["standardize_x"]`` and ``extra["standardize_y"]`` and apply those
+    transforms inside the model. LCGP and PUQ have their own internal
+    standardization; OILMM sees raw data and absorbs the scale through its
+    learnable kernel parameters.
+    """
+
+    if vah_grouping not in VAH_GROUPING_CHOICES:
+        raise ValueError(
+            f"vah_grouping must be one of {VAH_GROUPING_CHOICES}, got {vah_grouping!r}."
+        )
+
+    theta, f = _load_vah_arrays()
+    n_total = theta.shape[0]
+    fold_seed = stable_seed(base_seed, "vah_nuclear", "kfold", n_folds)
+    folds = _kfold_indices(n_total, n_folds, seed=fold_seed)
+
+    fold_index = (int(rep) - 1) % n_folds
+    test_idx = folds[fold_index]
+    train_mask = np.ones(n_total, dtype=bool)
+    train_mask[test_idx] = False
+    train_idx = np.flatnonzero(train_mask)
+
+    X_train = theta[train_idx]
+    X_test = theta[test_idx]
+    Y_train = f[train_idx]
+    Y_test = f[test_idx]
+
+    diag_error_structure: list[int] | None = None
+    if vah_grouping == "index":
+        diag_error_structure = _load_vah_diag_error_structure(expected_p=Y_train.shape[1])
+
+    train_data = {
+        "X_scaled": np.asarray(X_train, dtype=float),
+        "Y": np.asarray(Y_train, dtype=float),
+        "y": np.asarray(Y_train, dtype=float),
+    }
+    return DatasetBundle(
+        function="vah_nuclear",
+        n=int(X_train.shape[0]),
+        p=int(Y_train.shape[1]),
+        seed_data=int(fold_seed),
+        train_data=train_data,
+        test_X_scaled=np.asarray(X_test, dtype=float),
+        test_Y_true=np.asarray(Y_test, dtype=float),
+        extra={
+            "fold_index": fold_index,
+            "n_folds": n_folds,
+            "diag_error_structure": diag_error_structure,
+            "standardize_x": "unitcube",
+            "standardize_y": "zscore",
+        },
+    )
+
+
 def make_latent_theta0_and_bounds(q: int, d: int, seed_model: int) -> tuple[np.ndarray, list[tuple[float, float]]]:
     """Build the fixed latent initialization used in ``fit_moogp_forrester``."""
 
@@ -372,8 +541,8 @@ def make_latent_theta0_and_bounds(q: int, d: int, seed_model: int) -> tuple[np.n
     for _ in range(q):
         theta0.append(float(np.log(1.0)))
         theta0.extend([float(np.log(0.5))] * d)
-        bounds.append((float(np.log(1e-3)), float(np.log(1e3))))
-        bounds.extend([(float(np.log(0.05)), float(np.log(5.0)))] * d)
+        bounds.append((float(np.log(1e-3)), float(np.log(1e6))))
+        bounds.extend([(float(np.log(0.05)), float(np.log(100.0)))] * d)
 
     return np.asarray(theta0, dtype=float), bounds
 
@@ -382,10 +551,25 @@ def append_sigma_eps_theta0_and_bounds(
     theta0: np.ndarray,
     bounds: list[tuple[float, float]],
     y_train: np.ndarray,
+    diag_error_structure: list[int] | None = None,
 ) -> tuple[np.ndarray, list[tuple[float, float]]]:
-    """Append the sigma-eps block exactly as in ``fit_moogp_forrester``."""
+    """Append the sigma-eps block exactly as in ``fit_moogp_forrester``.
+
+    With a non-trivial ``diag_error_structure``, MOOGP carries one log-variance
+    per group rather than per output, so we collapse the per-output sample
+    variances to per-group means before initializing.
+    """
 
     y_var = np.maximum(1e-12, np.var(np.asarray(y_train, dtype=float), axis=0, ddof=1))
+    if diag_error_structure is not None:
+        sizes = np.asarray(diag_error_structure, dtype=int)
+        if int(sizes.sum()) != y_var.size:
+            raise ValueError(
+                f"diag_error_structure widths sum to {int(sizes.sum())} but "
+                f"y has {y_var.size} columns."
+            )
+        breakpoints = np.concatenate([[0], np.cumsum(sizes)[:-1]])
+        y_var = np.add.reduceat(y_var, breakpoints) / sizes
     sigma_eps2_init = np.log(1e-2 * y_var)
     theta0_out = np.concatenate([theta0, sigma_eps2_init])
 
@@ -393,6 +577,83 @@ def append_sigma_eps_theta0_and_bounds(
     ub = np.maximum(lb * 10.0, 0.5 * y_var)
     log_bounds = [(float(np.log(lbi)), float(np.log(ubi))) for lbi, ubi in zip(lb, ub)]
     return theta0_out, bounds + log_bounds
+
+
+def make_data_aware_theta0_and_bounds(
+    q: int,
+    d: int,
+    seed_model: int,
+    X_work: np.ndarray,
+    Y_work: np.ndarray,
+    diag_error_structure: list[int] | None = None,
+) -> tuple[np.ndarray, list[tuple[float, float]]]:
+    """Data-aware MOOGP initialization (bounds identical to the constant init).
+
+    The constant init (``make_latent_theta0_and_bounds`` +
+    ``append_sigma_eps_theta0_and_bounds``) starts every latent at
+    ``sigma^2 = 1``, every length-scale at ``0.5``, and the noise at
+    ``1e-2 * y_var``. On VAH that places the optimizer several orders of
+    magnitude (in log-space) from the NLL mode, so L-BFGS-B spends hundreds
+    of iterations just walking the scale parameters into range.
+
+    This builds the same box bounds but seeds ``theta0`` from the working-
+    scale data (mirroring LCGP's ``init_params``):
+
+    * ``sigma^2_k = s_k^2 / n`` where ``s_k`` are the singular values of
+      ``Y_work`` (undoes the ``Phi`` SVD normalization in the fast path).
+    * ``ell_{k,j} = exp(0.5*log(d) + log(std(X_work[:, j])))`` — the
+      ``sqrt(d) * std(X)`` heuristic, shared across latents.
+    * ``sigma^2_eps`` = per-group variance of the rank-``q`` SVD
+      reconstruction residual of ``Y_work`` (a data-implied noise floor).
+
+    All seeds are clipped into the box so the optimizer starts feasible.
+    Empirically (``notebooks/vah_moogp_diagnostic.ipynb`` §15) this reaches
+    the *same* NLL / RMSE / coverage as the constant init in ~32 % fewer
+    L-BFGS-B iterations on VAH fold 1.
+    """
+
+    # Reuse the constant path purely to get the (unchanged) box bounds.
+    _, bounds = make_latent_theta0_and_bounds(q=q, d=d, seed_model=seed_model)
+    _, bounds = append_sigma_eps_theta0_and_bounds(
+        theta0=np.zeros(q * (d + 1), dtype=float),
+        bounds=bounds,
+        y_train=Y_work,
+        diag_error_structure=diag_error_structure,
+    )
+
+    X_work = np.asarray(X_work, dtype=float)
+    Y_work = np.asarray(Y_work, dtype=float)
+    n = Y_work.shape[0]
+
+    U, svals, Vt = np.linalg.svd(Y_work, full_matrices=False)
+    s_q = np.maximum(svals[:q], 1e-12)
+    s2_k = (s_q ** 2) / float(n)  # = 1 / d_vals in moogp.model.init_phi
+
+    std_x = np.std(X_work, axis=0)
+    std_x = np.where(std_x > 1e-12, std_x, 1.0)
+    log_ell = 0.5 * np.log(d) + np.log(std_x)  # shared across latents
+
+    theta0: list[float] = []
+    for k in range(q):
+        theta0.append(float(np.log(max(s2_k[k], 1e-8))))
+        theta0.extend(float(v) for v in log_ell)
+
+    # Rank-q SVD reconstruction residual -> per-group noise-floor init.
+    Y_hat = U[:, :q] @ np.diag(svals[:q]) @ Vt[:q, :]
+    resid_var = np.maximum(np.var(Y_work - Y_hat, axis=0, ddof=1), 1e-12)
+    if diag_error_structure is not None:
+        sizes = np.asarray(diag_error_structure, dtype=int)
+        bp = np.concatenate([[0], np.cumsum(sizes)[:-1]])
+        resid_var = np.add.reduceat(resid_var, bp) / sizes
+    eps_init = np.log(resid_var)
+
+    theta0_arr = np.concatenate([np.asarray(theta0, dtype=float), eps_init])
+
+    # Clip every seed strictly inside its box so L-BFGS-B starts feasible.
+    lo = np.array([b[0] for b in bounds], dtype=float)
+    hi = np.array([b[1] for b in bounds], dtype=float)
+    theta0_arr = np.minimum(np.maximum(theta0_arr, lo), hi)
+    return theta0_arr, bounds
 
 
 def fit_method_local(method: str, bundle: DatasetBundle, seed_model: int, config: ExperimentConfig) -> FittedPredictor:
@@ -504,7 +765,7 @@ def _fit_moogp_like(
     *,
     orthogonal: bool,
 ) -> FittedPredictor:
-    from moogp.model import MOOGP, compute_working_y
+    from moogp.model import MOOGP, compute_working_x, compute_working_y
 
     # Exclude import/setup overhead, but include all model work required before predict.
     train_t0 = time.perf_counter()
@@ -512,9 +773,14 @@ def _fit_moogp_like(
     n, d = bundle.train_data["X_scaled"].shape
     p = y_train.shape[1]
     q_eff = effective_latent_rank(config.q, n=n, p=p)
-    # Both MOOGP and MOGP standardize outputs internally to reduce scale-driven
-    # pathologies in the fast Psi/sigma_eps parameterization.
-    standardize_y = "zscore"
+    # MOOGP defaults to standardize_x="unitcube" and standardize_y="zscore",
+    # which is what every bundle in this harness wants. A bundle can override
+    # via ``extra["standardize_x"]`` / ``extra["standardize_y"]``; passing the
+    # defaults through explicitly keeps the adapter behavior auditable.
+    standardize_y = bundle.extra.get("standardize_y", "zscore")
+    standardize_x = bundle.extra.get("standardize_x", "unitcube")
+    x_margin = float(bundle.extra.get("x_margin", 0.1))
+    diag_error_structure = bundle.extra.get("diag_error_structure")
 
     model = MOOGP(
         terms=[None] + list(range(1, d + 1)),
@@ -529,16 +795,34 @@ def _fit_moogp_like(
         use_diagonalized_interaction=config.use_fast,
         use_slow_kyinv=False,
         standardize_y=standardize_y,
+        standardize_x=standardize_x,
+        x_margin=x_margin,
+        diag_error_structure=diag_error_structure,
     )
     fit_data = {"X_scaled": bundle.train_data["X_scaled"], "y": y_train}
-    theta0, bounds = make_latent_theta0_and_bounds(q=q_eff, d=d, seed_model=seed_model)
+    # Data-aware initialization: same box bounds as the legacy constant init
+    # but theta0 seeded from the working-scale SVD / input spread. Reaches the
+    # same NLL/RMSE/coverage in ~32% fewer L-BFGS-B iterations on VAH
+    # (see notebooks/vah_moogp_diagnostic.ipynb §15).
+    X_work, _, _ = compute_working_x(
+        bundle.train_data["X_scaled"], model.standardize_x, margin=x_margin,
+    )
     y_work, _, _ = compute_working_y(y_train, model.standardize_y)
-    theta0, bounds = append_sigma_eps_theta0_and_bounds(theta0=theta0, bounds=bounds, y_train=y_work)
+    theta0, bounds = make_data_aware_theta0_and_bounds(
+        q=q_eff,
+        d=d,
+        seed_model=seed_model,
+        X_work=X_work,
+        Y_work=y_work,
+        diag_error_structure=diag_error_structure,
+    )
     model.fit(
         data=fit_data,
         theta0=theta0,
         bounds=bounds,
-        optimizer_opts={"maxiter": config.maxiter},
+        optimizer_opts={"maxiter": config.maxiter,
+                        # "ftol": 1e10*np.finfo(float).eps
+                        },
     )
     train_time_sec = time.perf_counter() - train_t0
 
@@ -590,13 +874,17 @@ def _fit_lcgp(
     n, _ = X_train.shape
     p = Y_train.shape[1]
     q_eff = effective_latent_rank(config.q, n=n, p=p)
+    diag_error_structure = bundle.extra.get("diag_error_structure")
 
-    model = LCGP(
-        y=Y_train.T,
-        x=X_train,
-        q=q_eff,
-        verbose=False,
-    )
+    lcgp_kwargs: dict[str, Any] = {
+        "y": Y_train.T,
+        "x": X_train,
+        "q": q_eff,
+        "verbose": False,
+    }
+    if diag_error_structure is not None:
+        lcgp_kwargs["diag_error_structure"] = list(diag_error_structure)
+    model = LCGP(**lcgp_kwargs)
     opt_result = gpflow.optimizers.Scipy().minimize(
         model.loss,
         model.trainable_variables,
@@ -717,9 +1005,82 @@ def _fit_oilmm(
     fit_kwargs["jit"] = False
     fit_kwargs["iters"] = config.maxiter
 
-    prior.fit(X_fit, Y_train, **fit_kwargs)
+    # OILMM (via varz) ultimately calls ``scipy.optimize.fmin_l_bfgs_b`` and
+    # discards the returned ``info`` dict, which is the only place
+    # ``nit`` / ``funcalls`` / termination message live. ``varz/minimise.py``
+    # does ``from scipy.optimize import fmin_l_bfgs_b`` at module load, so we
+    # must patch the **module-level binding inside ``varz.minimise``** — patching
+    # ``scipy.optimize.fmin_l_bfgs_b`` is a no-op once varz has already bound
+    # the name. Restored in ``finally`` even if ``fit`` raises.
+    #
+    # Guard the import: the unit-test path mocks ``_get_oilmm_runtime`` and runs
+    # in the main moogp venv where ``varz`` is not installed. In that case we
+    # skip the patch (diagnostics stay blank) and let the mocked ``fit`` run.
+    oilmm_opt_records: list[dict[str, Any]] = []
+    try:
+        import varz.minimise as _varz_min
+    except ModuleNotFoundError:
+        _varz_min = None
+
+    if _varz_min is not None:
+        _orig_fmin_l_bfgs_b = _varz_min.fmin_l_bfgs_b
+
+        def _capturing_fmin_l_bfgs_b(*args, **kwargs):
+            x_opt, val_opt, info = _orig_fmin_l_bfgs_b(*args, **kwargs)
+            # ``info`` keys per scipy.optimize.fmin_l_bfgs_b docs:
+            #   'nit'      -> number of L-BFGS-B iterations
+            #   'funcalls' -> number of objective+gradient evaluations
+            #   'task'     -> termination reason (bytes or str)
+            #   'warnflag' -> 0=converged, 1=hit maxiter, 2=other failure
+            oilmm_opt_records.append({
+                "nit": int(info.get("nit", 0)),
+                "funcalls": int(info.get("funcalls", 0)),
+                "task": info.get("task", b""),
+                "warnflag": int(info.get("warnflag", 0)),
+            })
+            return x_opt, val_opt, info
+
+        _varz_min.fmin_l_bfgs_b = _capturing_fmin_l_bfgs_b
+        try:
+            prior.fit(X_fit, Y_train, **fit_kwargs)
+        finally:
+            _varz_min.fmin_l_bfgs_b = _orig_fmin_l_bfgs_b
+    else:
+        prior.fit(X_fit, Y_train, **fit_kwargs)
     posterior = prior.condition(X_fit, Y_train)
     train_time_sec = time.perf_counter() - train_t0
+
+    # Aggregate per-output L-BFGS-B runs into the standard diagnostic columns.
+    # OILMM's IMOGP-style fit calls the optimiser once per output (or once
+    # total in the OILMM-proper dispatch); summing keeps the columns honest
+    # regardless of which dispatch ran.
+    oilmm_nit = sum(r["nit"] for r in oilmm_opt_records) or None
+    oilmm_nfev = sum(r["funcalls"] for r in oilmm_opt_records) or None
+    # Each L-BFGS-B step calls the joint objective+gradient closure once, so
+    # njev equals funcalls under varz's wrapping. Report it explicitly so the
+    # column is populated.
+    oilmm_njev = oilmm_nfev
+
+    def _decode_task(t: Any) -> str:
+        if isinstance(t, (bytes, bytearray)):
+            return t.decode("utf-8", errors="replace")
+        return str(t)
+
+    if oilmm_opt_records:
+        # status: ok unless any sub-fit returned a non-zero warnflag.
+        oilmm_status = "ok"
+        oilmm_error = ""
+        for r in oilmm_opt_records:
+            if r["warnflag"] != 0:
+                oilmm_status = "opt_failed"
+                oilmm_error = _decode_task(r["task"])
+                break
+    else:
+        # Defensive: if the patch never caught a call (e.g. OILMM switched
+        # to a different minimiser), keep the legacy "ok / no diagnostics"
+        # behaviour rather than fabricating values.
+        oilmm_status = "ok"
+        oilmm_error = ""
 
     def _predict(Xstar: np.ndarray) -> PredictionBundle:
         Xs = _oilmm_prepare_X(np.asarray(Xstar, dtype=np.float32))
@@ -745,10 +1106,12 @@ def _fit_oilmm(
 
     return FittedPredictor(
         predict_fn=_predict,
-        status="ok",
-        error="",
+        status=oilmm_status,
+        error=oilmm_error,
         train_time_sec=train_time_sec,
-        **blank_optimizer_diagnostics(),
+        nit=oilmm_nit,
+        njev=oilmm_njev,
+        nfev=oilmm_nfev,
     )
 
 
@@ -799,26 +1162,76 @@ def _fit_puq(
     )
     train_time_sec = time.perf_counter() - train_t0
 
+    # PUQ's multihetGP wraps one ``hetgpy.hetGP`` per output column. Each
+    # per-output emulator's ``_info`` dict carries the optimiser counters
+    # populated by ``hetGP.mleHetGP`` (or, when the homoskedastic fallback
+    # fires, by ``homGP.mleHomGP`` — see hetGP.py:1256-1264). The shape of
+    # ``nit_opt`` differs across the two paths:
+    #
+    #   hetGP path  -> ``{"nfev": ..., "njev": ...}``  (hetGP.py:1191)
+    #   homGP path  -> ``int`` (= nfev only; homGP discards njev)
+    #
+    # In both cases scipy's ``OptimizeResult.nit`` is dropped, so we report
+    # ``njev`` as a proxy for ``nit``: with the analytical gradient L-BFGS-B
+    # invokes the objective+gradient closure once per accepted iteration.
+    # ``msg`` carries the scipy termination message used for the status.
+    puq_nfev_total = 0
+    puq_njev_total = 0
+    puq_status = "ok"
+    puq_error = ""
+    sub_emulators = emu._info.get("emulist", []) if hasattr(emu, "_info") else []
+    for sub in sub_emulators:
+        sub_info = getattr(sub, "_info", {}) or {}
+        nit_opt = sub_info.get("nit_opt")
+        if isinstance(nit_opt, dict):
+            puq_nfev_total += int(nit_opt.get("nfev", 0) or 0)
+            puq_njev_total += int(nit_opt.get("njev", 0) or 0)
+        elif isinstance(nit_opt, (int, np.integer)):
+            # homGP fallback: only nfev is preserved. Use it for both
+            # counters so the column is not silently dropped.
+            puq_nfev_total += int(nit_opt)
+            puq_njev_total += int(nit_opt)
+        msg = sub_info.get("msg", "")
+        if isinstance(msg, (bytes, bytearray)):
+            msg = msg.decode("utf-8", errors="replace")
+        msg_lower = str(msg).lower()
+        if msg and "converge" not in msg_lower:
+            puq_status = "opt_failed"
+            puq_error = puq_error or str(msg)
+    # When mleHetGP captured nothing, leave the columns blank rather than
+    # fabricate zeros.
+    puq_nfev = puq_nfev_total or None
+    puq_njev = puq_njev_total or None
+    puq_nit = puq_njev  # one gradient eval per L-BFGS-B iteration
+
     def _predict(Xstar: np.ndarray) -> PredictionBundle:
         Xs = np.asarray(Xstar, dtype=float)
         # thetaprime=None keeps PUQ from building cross-location covariances we
         # don't use here.
         preds = emu.predict(x=Xs, thetaprime=None)
         mean_pn = np.asarray(preds._info["mean"], dtype=float)
+        # `var` is the mean-process (epistemic) variance only; `nugs` is the
+        # heteroskedastic observation-noise variance. The predictive variance of
+        # a new observation is their sum. Using `var` alone yields a confidence
+        # band rather than a prediction interval and badly under-covers, unlike
+        # the other methods which all return observation-level predictive vars.
         var_pn = np.asarray(preds._info["var"], dtype=float)
+        nugs_pn = np.asarray(preds._info["nugs"], dtype=float)
         if mean_pn.shape != (p, Xs.shape[0]):
             raise ValueError(
                 f"Unexpected PUQ prediction shape {mean_pn.shape}; expected {(p, Xs.shape[0])}."
             )
-        var_pn = np.maximum(var_pn, 1e-12)
-        return PredictionBundle(mean=mean_pn.T, std=np.sqrt(var_pn).T, cov=None)
+        total_var_pn = np.maximum(var_pn + nugs_pn, 1e-12)
+        return PredictionBundle(mean=mean_pn.T, std=np.sqrt(total_var_pn).T, cov=None)
 
     return FittedPredictor(
         predict_fn=_predict,
-        status="ok",
-        error="",
+        status=puq_status,
+        error=puq_error,
         train_time_sec=train_time_sec,
-        **blank_optimizer_diagnostics(),
+        nit=puq_nit,
+        njev=puq_njev,
+        nfev=puq_nfev,
     )
 
 
@@ -836,6 +1249,7 @@ def compute_metrics(y_true: np.ndarray, prediction: PredictionBundle) -> dict[st
 
     metrics: dict[str, float | None] = {
         "rmse": float(rmse(y_true, y_mean)),
+        "normalized_rmse": float(normalized_rmse(y_true, y_mean)),
         "coverage_95": None,
         "interval_len_95": None,
         "dss_diag": None,
@@ -883,6 +1297,7 @@ def make_base_row(
     rep: int,
     seed_data: int,
     seed_model: int,
+    n_folds: int | None = None,
 ) -> dict[str, Any]:
     """Create a CSV row with the required schema."""
 
@@ -896,16 +1311,21 @@ def make_base_row(
         "rep": rep,
         "seed_data": seed_data,
         "seed_model": seed_model,
+        "n_train": None,
         "status": "",
         "error": "",
         "train_time_sec": None,
         "pred_time_sec": None,
         **blank_optimizer_diagnostics(),
         "rmse": None,
+        "normalized_rmse": None,
+        "train_rmse": None,
+        "train_normalized_rmse": None,
         "coverage_95": None,
         "interval_len_95": None,
         "dss_diag": None,
         "dss_full": None,
+        "n_folds": n_folds,
     }
 
 
@@ -924,6 +1344,7 @@ def run_single_method_local(
     seed_data = bundle.seed_data
     seed_model = stable_seed(config.base_seed, function, method, n, p, rep, "model")
     q_eff = effective_latent_rank(config.q, n=n, p=p)
+    n_folds_row = config.n_folds if function == "vah_nuclear" else None
     row = make_base_row(
         run_id=run_id,
         function=function,
@@ -934,7 +1355,11 @@ def run_single_method_local(
         rep=rep,
         seed_data=seed_data,
         seed_model=seed_model,
+        n_folds=n_folds_row,
     )
+    # `n` is the grid label (for vah it is the full dataset size); `n_train` is
+    # the actual number of rows the model was fit on (post train/test split).
+    row["n_train"] = int(bundle.n)
 
     try:
         predictor = fit_method_local(method=method, bundle=bundle, seed_model=seed_model, config=config)
@@ -949,6 +1374,12 @@ def run_single_method_local(
         prediction = predictor.predict(bundle.test_X_scaled)
         row["pred_time_sec"] = time.perf_counter() - t1
         row.update(compute_metrics(bundle.test_Y_true, prediction))
+
+        train_prediction = predictor.predict(bundle.train_data["X_scaled"])
+        y_train_true = np.asarray(bundle.train_data["Y"], dtype=float)
+        y_train_mean = np.asarray(train_prediction.mean, dtype=float)
+        row["train_rmse"] = float(rmse(y_train_true, y_train_mean))
+        row["train_normalized_rmse"] = float(normalized_rmse(y_train_true, y_train_mean))
     except NotImplementedError as exc:
         row["status"] = "not_implemented"
         row["error"] = str(exc)
@@ -980,6 +1411,7 @@ def run_single_method_subprocess(
 
     seed_model = stable_seed(config.base_seed, function, method, n, p, rep, "model")
     q_eff = effective_latent_rank(config.q, n=n, p=p)
+    n_folds_row = config.n_folds if function == "vah_nuclear" else None
     row = make_base_row(
         run_id=run_id,
         function=function,
@@ -990,6 +1422,7 @@ def run_single_method_subprocess(
         rep=rep,
         seed_data=seed_data,
         seed_model=seed_model,
+        n_folds=n_folds_row,
     )
 
     python_executable = method_python_executable(method, config)
@@ -1061,6 +1494,10 @@ def run_single_method_job_local(
         n_test=config.n_test,
         seed_data=seed_data,
         noise_var_frac=config.noise_var_frac,
+        rep=rep,
+        n_folds=config.n_folds,
+        vah_grouping=config.vah_grouping,
+        base_seed=config.base_seed,
     )
     return run_single_method_local(
         run_id=run_id,
@@ -1172,9 +1609,22 @@ def iter_job_cells(config: ExperimentConfig):
 
     Used by both the in-process runner and the per-job emission path so the two
     code paths can never disagree about which cells exist in a sweep.
+
+    The ``vah_nuclear`` function ignores ``sample_sizes`` / ``output_dims``;
+    each rep maps to one held-out CV fold, with ``n`` set to the fixed dataset
+    row count and ``p`` to the fixed observable count. The number of folds run
+    is ``min(config.reps, config.n_folds)`` — pass ``--reps n_folds`` for full
+    CV, or a smaller ``--reps`` to run only the first few folds (useful for
+    quick smokes).
     """
 
     for function in config.functions:
+        if function == "vah_nuclear":
+            n_vah_reps = min(int(config.reps), int(config.n_folds))
+            for rep in range(1, n_vah_reps + 1):
+                for method in config.methods:
+                    yield function, method, VAH_TOTAL_N, VAH_P, rep
+            continue
         for p in config.output_dims:
             for n in config.sample_sizes:
                 for rep in range(1, config.reps + 1):

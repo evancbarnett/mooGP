@@ -301,6 +301,7 @@ class TestMOOGPNLLExactness:
             use_diagonalized_interaction=True,
             use_slow_kyinv=False,
             standardize_y=False,
+            standardize_x=False,
         )
         model._prepare_data({"X_scaled": X, "y": Y})
         nll_fast = float(model._nll(theta0, build_cache=False))
@@ -343,7 +344,8 @@ class TestMOOGPNLLExactness:
         qf = float(vecY @ alpha - b_gls @ beta)
         logdetK = 2.0 * float(np.sum(np.log(np.diag(L))))
         n = X.shape[0]
-        nll_ref = 0.5 * (logdetK + qf + (n * p) * np.log(2.0 * np.pi))
+        # ``MOOGP._nll`` returns ``NLL / n`` (per-row); match here.
+        nll_ref = 0.5 * (logdetK + qf + (n * p) * np.log(2.0 * np.pi)) / float(n)
 
         np.testing.assert_allclose(nll_fast, nll_ref, rtol=1e-10, atol=1e-10)
 
@@ -371,6 +373,7 @@ class TestMOOGPNLLExactness:
             use_diagonalized_interaction=True,
             use_slow_kyinv=False,
             standardize_y=False,
+            standardize_x=False,
         )
         model._prepare_data({"X_scaled": X, "y": Y})
 

@@ -64,6 +64,7 @@ def _make_model(X, Y, q, *, learn_sigma_eps=True, orthogonal=True, use_analytica
         use_slow_kyinv=False,
         standardize_y=False,
         use_analytical_grad=use_analytical_grad,
+        standardize_x=False,
     )
     model._prepare_data({"X_scaled": X, "y": Y})
     return model
@@ -104,6 +105,7 @@ class TestAnalyticalNLLValue:
             use_slow_kyinv=False,
             standardize_y=False,
             use_analytical_grad=True,
+            standardize_x=False,
         )
         model._prepare_data({"X_scaled": X, "y": Y})
 

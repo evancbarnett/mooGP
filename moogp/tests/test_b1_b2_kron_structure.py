@@ -78,6 +78,7 @@ def _make_fitted_model(X, Y, q, *, orthogonal=True, learn_sigma_eps=True):
         use_slow_kyinv=False,
         standardize_y=False,
         use_analytical_grad=True,
+        standardize_x=False,
     )
     # Use a single _nll call rather than full optimisation to keep tests fast
     # and deterministic; this still populates the cache and exercises the fast
@@ -188,6 +189,7 @@ class TestNLLAfterFix:
             learn_Psi=False, learn_sigma_eps=True, jitter=0.0,
             use_diagonalized_interaction=True, use_slow_kyinv=False,
             standardize_y=False,
+            standardize_x=False,
         )
         model._prepare_data({"X_scaled": X, "y": Y})
         nll_fast = float(model._nll(theta, build_cache=False))
@@ -209,7 +211,9 @@ class TestNLLAfterFix:
         beta = np.linalg.solve(A_gls, b_gls)
         qf = float(vecY @ alpha - b_gls @ beta)
         logdetK = 2.0 * float(np.sum(np.log(np.diag(L_full))))
-        nll_ref = 0.5 * (logdetK + qf + (n * p) * np.log(2.0 * np.pi))
+        # ``MOOGP._nll`` returns the per-row negative log-likelihood
+        # (``NLL / n``); match that here so the dense reference is comparable.
+        nll_ref = 0.5 * (logdetK + qf + (n * p) * np.log(2.0 * np.pi)) / float(n)
 
         np.testing.assert_allclose(nll_fast, nll_ref, rtol=1e-10, atol=1e-10)
 
@@ -226,6 +230,7 @@ class TestNLLAfterFix:
             learn_Psi=False, learn_sigma_eps=True, jitter=0.0,
             use_diagonalized_interaction=True, use_slow_kyinv=False,
             standardize_y=False, use_analytical_grad=False,
+            standardize_x=False,
         )
         model._prepare_data({"X_scaled": X, "y": Y})
 
@@ -262,6 +267,7 @@ class TestNLLAfterFix:
             jitter=0.0, use_diagonalized_interaction=True,
             use_slow_kyinv=False, standardize_y=False,
             use_analytical_grad=True,
+            standardize_x=False,
         )
         model._prepare_data({"X_scaled": X, "y": Y})
 
@@ -356,6 +362,7 @@ class TestPredictEndToEndUnchanged:
             learn_Psi=False, learn_sigma_eps=True, jitter=0.0,
             use_diagonalized_interaction=True, use_slow_kyinv=False,
             standardize_y=False, use_analytical_grad=True,
+            standardize_x=False,
         )
         m_fast._prepare_data({"X_scaled": X, "y": Y})
         m_fast._nll(theta, build_cache=True)
@@ -374,6 +381,7 @@ class TestPredictEndToEndUnchanged:
             learn_Psi=False, learn_sigma_eps=True, jitter=0.0,
             use_diagonalized_interaction=False, use_slow_kyinv=True,
             standardize_y=False, use_analytical_grad=False,
+            standardize_x=False,
         )
         m_slow._prepare_data({"X_scaled": X, "y": Y})
         m_slow._nll(theta, build_cache=True)

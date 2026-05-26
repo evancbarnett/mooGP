@@ -29,6 +29,8 @@ def test_learn_sigma_eps_fixed_psi():
         jitter=None,
         one_based=True,
         normalize_cols=True,
+        standardize_x=False,
+        standardize_y=False,
     )
 
 

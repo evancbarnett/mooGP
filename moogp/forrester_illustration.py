@@ -48,7 +48,20 @@ def eval_linear_trend(X_raw, betas_raw, output_idx):
     return betas_raw[0, output_idx] + betas_raw[1, output_idx] * x
 
 
-def rmspe_1d(y_true, y_pred):
+PREDICTIVE_METRIC_LABELS = {
+    "rmse_y": "RMSE(y)",
+    "rmse_f": "RMSE(f)",
+    "nrmse_y": "NRMSE(y)",
+    "coverage_95_y": "Coverage95(y)",
+    "width_95_y": "Width95(y)",
+    "dss_y": "DSS(y)",
+}
+
+TREND_GRID_RMSE_KEY = "rmse_f_grid"
+TREND_GRID_RMSE_LABEL = "RMSE(f_grid)"
+
+
+def rmse_1d(y_true, y_pred):
     y_true = np.asarray(y_true).ravel()
     y_pred = np.asarray(y_pred).ravel()
     return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
@@ -130,7 +143,9 @@ def fit_moogp_forrester(n_train=50,
         learn_sigma_eps=True,
         jitter=1e-10,
         normalize_cols=True,
-        use_diagonalized_interaction=use_fast  # Fast computation
+        use_diagonalized_interaction=use_fast,  # Fast computation
+        standardize_x=False,
+        standardize_y=False,
     )
     theta0, bounds = build_forrester_theta0_bounds(Y, q, d)
 
@@ -806,13 +821,13 @@ def evaluate_moogp(
     n_test=200,
     seed=999,
     output_idx=0,
-    n_rmspe=400,
+    n_grid=400,
     scheme_name=None,
 ):
     """
     Returns:
       - predictive: your original train/test table inputs
-      - trend_table: RMSPE + beta0/beta1 for one observation scheme
+      - trend_table: grid RMSE + beta0/beta1 for one observation scheme and all outputs
                      (to be compared later across two schemes)
     """
 
@@ -825,27 +840,27 @@ def evaluate_moogp(
     p = Y_train.shape[1]
 
     def get_metrics(ftrue, ytrue, ypred, yvar=None, train=False, modelname=""):
-        rec_rmse_val = rmse(ftrue, ypred)
-        pred_rmse_val = rmse(ytrue, ypred)
-        nrmse_val = normalized_rmse(ytrue, ypred)
+        rmse_f_val = rmse(ftrue, ypred)
+        rmse_y_val = rmse(ytrue, ypred)
+        nrmse_y_val = normalized_rmse(ytrue, ypred)
 
         if yvar is not None:
-            pcover, pwidth = intervalstats(ytrue, ypred, yvar)
-            dss_val = dss(ytrue, ypred, yvar, use_diag=True)
+            coverage_95_y_val, width_95_y_val = intervalstats(ytrue, ypred, yvar)
+            dss_y_val = dss(ytrue, ypred, yvar, use_diag=True)
         else:
-            pcover = pwidth = dss_val = None
+            coverage_95_y_val = width_95_y_val = dss_y_val = None
 
         split_label = "train set metrics" if train else "test set metrics"
 
         return {
             "modelname": modelname,
             "modeltrain": split_label,
-            "predrmse": pred_rmse_val,
-            "recrmse": rec_rmse_val,
-            "nrmse": nrmse_val,
-            "pcover": pcover,
-            "pwidth": pwidth,
-            "dss": dss_val,
+            "rmse_y": rmse_y_val,
+            "rmse_f": rmse_f_val,
+            "nrmse_y": nrmse_y_val,
+            "coverage_95_y": coverage_95_y_val,
+            "width_95_y": width_95_y_val,
+            "dss_y": dss_y_val,
         }
 
     # -------------------
@@ -903,11 +918,11 @@ def evaluate_moogp(
 
     # -------------------
     # PLUMLEE-JOSEPH-STYLE TREND TABLE (single scheme)
-    # RMSPE over 400 equally spaced points + fitted betas
+    # Grid RMSE over equally spaced points + fitted betas
     # -------------------
-    X_grid = np.linspace(0.0, 1.0, n_rmspe).reshape(-1, 1)
+    X_grid = np.linspace(0.0, 1.0, n_grid).reshape(-1, 1)
     grid_data = generate_forrester_data(
-        n=n_rmspe,
+        n=n_grid,
         seed=seed,
         with_error=False,
         X_override=X_grid,
@@ -915,41 +930,53 @@ def evaluate_moogp(
     X_grid_scaled = grid_data["X_scaled"]
     F_grid = grid_data["f"]
 
+    if not 0 <= output_idx < p:
+        raise ValueError(f"output_idx must be between 0 and {p - 1}; got {output_idx}.")
+
     trend_table = {
         "scheme_name": scheme_name,
         "output_idx": output_idx,
-        "n_rmspe": n_rmspe,
-        "rows": {}
+        "n_grid": n_grid,
+        "rows": {},
+        "outputs": []
     }
+
+    trend_rows_by_output = [{"output_idx": j, "rows": {}} for j in range(p)]
 
     # OLS
     if ols:
-        G_grid_ls = np.column_stack([np.ones((n_rmspe, 1)), X_grid])
+        G_grid_ls = np.column_stack([np.ones((n_grid, 1)), X_grid])
         Y_grid_pred_ls = G_grid_ls @ B_ls
-        trend_table["rows"]["ols"] = {
-            "rmspe": rmspe_1d(F_grid[:, output_idx], Y_grid_pred_ls[:, output_idx]),
-            "beta0": float(B_ls[0, output_idx]),
-            "beta1": float(B_ls[1, output_idx]),
-        }
+        for j, trend_output in enumerate(trend_rows_by_output):
+            trend_output["rows"]["ols"] = {
+                TREND_GRID_RMSE_KEY: rmse_1d(F_grid[:, j], Y_grid_pred_ls[:, j]),
+                "beta0": float(B_ls[0, j]),
+                "beta1": float(B_ls[1, j]),
+            }
 
     # MOOGP
     Y_grid_pred_moogp, _ = model.predict(X_grid_scaled, return_std=True)
     beta_moogp = get_model_trend_betas_raw(model)
-    trend_table["rows"]["moogp"] = {
-        "rmspe": rmspe_1d(F_grid[:, output_idx], Y_grid_pred_moogp[:, output_idx]),
-        "beta0": float(beta_moogp[0, output_idx]),
-        "beta1": float(beta_moogp[1, output_idx]),
-    }
+    for j, trend_output in enumerate(trend_rows_by_output):
+        trend_output["rows"]["moogp"] = {
+            TREND_GRID_RMSE_KEY: rmse_1d(F_grid[:, j], Y_grid_pred_moogp[:, j]),
+            "beta0": float(beta_moogp[0, j]),
+            "beta1": float(beta_moogp[1, j]),
+        }
 
     # MOGP
     if non_ortho_model is not None:
         Y_grid_pred_mogp, _ = non_ortho_model.predict(X_grid_scaled, return_std=True)
         beta_mogp = get_model_trend_betas_raw(non_ortho_model)
-        trend_table["rows"]["mogp"] = {
-            "rmspe": rmspe_1d(F_grid[:, output_idx], Y_grid_pred_mogp[:, output_idx]),
-            "beta0": float(beta_mogp[0, output_idx]),
-            "beta1": float(beta_mogp[1, output_idx]),
-        }
+        for j, trend_output in enumerate(trend_rows_by_output):
+            trend_output["rows"]["mogp"] = {
+                TREND_GRID_RMSE_KEY: rmse_1d(F_grid[:, j], Y_grid_pred_mogp[:, j]),
+                "beta0": float(beta_mogp[0, j]),
+                "beta1": float(beta_mogp[1, j]),
+            }
+
+    trend_table["outputs"] = trend_rows_by_output
+    trend_table["rows"] = trend_rows_by_output[output_idx]["rows"]
 
     return {
         "predictive": predictive,
@@ -962,26 +989,33 @@ def print_predictive_table(results, scheme_label):
     Expects results to be the output of evaluate_moogp(...).
     """
     predictive = results["predictive"]
+    metric_keys = [
+        "rmse_y",
+        "rmse_f",
+        "nrmse_y",
+        "coverage_95_y",
+        "width_95_y",
+        "dss_y",
+    ]
+
+    def format_metric(metrics, key):
+        value = metrics[key]
+        return f"{value:.4f}" if value is not None else "N/A"
 
     print("-" * 35 + scheme_label + "-" * 35)
-    print(f"{'Model':<8} | {'Split':<6} | {'Pred RMSE':<10} | {'Rec RMSE':<10} | {'NRMSE':<8} | {'Coverage':<10} | {'Width':<8} | {'DSS':<8}")
-    print("-" * 95)
+    metric_header = " | ".join(f"{PREDICTIVE_METRIC_LABELS[key]:<12}" for key in metric_keys)
+    print(f"{'Model':<8} | {'Split':<6} | {metric_header}")
+    print("-" * 111)
 
     for model_key, splits in predictive.items():
         if splits is None:
             continue
 
         for split_key, metrics in splits.items():
-            pred_rmse_val = f"{metrics['predrmse']:.4f}" if metrics['predrmse'] is not None else "N/A"
-            rec_rmse_val = f"{metrics['recrmse']:.4f}" if metrics['recrmse'] is not None else "N/A"
-            nrmse_val = f"{metrics['nrmse']:.4f}" if metrics['nrmse'] is not None else "N/A"
-            pcover_val = f"{metrics['pcover']:.4f}" if metrics['pcover'] is not None else "N/A"
-            pwidth_val = f"{metrics['pwidth']:.4f}" if metrics['pwidth'] is not None else "N/A"
-            dss_val = f"{metrics['dss']:.4f}" if metrics['dss'] is not None else "N/A"
-
             split_name = "Train" if "train" in split_key else "Test"
+            metric_values = " | ".join(f"{format_metric(metrics, key):<12}" for key in metric_keys)
 
-            print(f"{model_key.upper():<8} | {split_name:<6} | {pred_rmse_val:<10} | {rec_rmse_val:<10} | {nrmse_val:<8} | {pcover_val:<10} | {pwidth_val:<8} | {dss_val:<8}")
+            print(f"{model_key.upper():<8} | {split_name:<6} | {metric_values}")
 
 
 def print_trend_comparison_table(results_scheme1, results_scheme2, scheme1_label="LHS", scheme2_label="log-LHS"):
@@ -991,39 +1025,46 @@ def print_trend_comparison_table(results_scheme1, results_scheme2, scheme1_label
     t1 = results_scheme1["trend_table"]
     t2 = results_scheme2["trend_table"]
 
-    output_idx_1 = t1["output_idx"]
-    output_idx_2 = t2["output_idx"]
-    if output_idx_1 != output_idx_2:
-        raise ValueError("Both trend tables must use the same output_idx.")
+    outputs1 = t1.get("outputs", [{"output_idx": t1["output_idx"], "rows": t1["rows"]}])
+    outputs2 = t2.get("outputs", [{"output_idx": t2["output_idx"], "rows": t2["rows"]}])
 
-    rows1 = t1["rows"]
-    rows2 = t2["rows"]
+    outputs1_by_idx = {entry["output_idx"]: entry["rows"] for entry in outputs1}
+    outputs2_by_idx = {entry["output_idx"]: entry["rows"] for entry in outputs2}
+    if outputs1_by_idx.keys() != outputs2_by_idx.keys():
+        raise ValueError("Both trend tables must contain the same output indices.")
 
     print()
-    print(f"Trend comparison for Output {output_idx_1 + 1}")
-    print(f"{'Model':<8} | "
-          f"{scheme1_label + ' RMSPE':<14} | {'beta0':<10} | {'beta1':<10} | "
-          f"{scheme2_label + ' RMSPE':<14} | {'beta0':<10} | {'beta1':<10} | "
-          f"{'|Δbeta0|':<10} | {'|Δbeta1|':<10}")
-    print("-" * 120)
-
     row_order = ["ols", "moogp", "mogp"]
     row_names = {"ols": "LS", "moogp": "MOOGP", "mogp": "MOGP"}
 
-    for key in row_order:
-        if key not in rows1 or key not in rows2:
-            continue
+    for table_idx, output_idx in enumerate(sorted(outputs1_by_idx)):
+        if table_idx > 0:
+            print()
 
-        a = rows1[key]
-        b = rows2[key]
+        rows1 = outputs1_by_idx[output_idx]
+        rows2 = outputs2_by_idx[output_idx]
 
-        db0 = abs(b["beta0"] - a["beta0"])
-        db1 = abs(b["beta1"] - a["beta1"])
+        print(f"Trend comparison for Output {output_idx + 1}")
+        print(f"{'Model':<8} | "
+              f"{scheme1_label + ' ' + TREND_GRID_RMSE_LABEL:<20} | {'beta0':<10} | {'beta1':<10} | "
+              f"{scheme2_label + ' ' + TREND_GRID_RMSE_LABEL:<20} | {'beta0':<10} | {'beta1':<10} | "
+              f"{'|Δbeta0|':<10} | {'|Δbeta1|':<10}")
+        print("-" * 132)
 
-        print(f"{row_names[key]:<8} | "
-              f"{a['rmspe']:<14.6f} | {a['beta0']:<10.4f} | {a['beta1']:<10.4f} | "
-              f"{b['rmspe']:<14.6f} | {b['beta0']:<10.4f} | {b['beta1']:<10.4f} | "
-              f"{db0:<10.4f} | {db1:<10.4f}")
+        for key in row_order:
+            if key not in rows1 or key not in rows2:
+                continue
+
+            a = rows1[key]
+            b = rows2[key]
+
+            db0 = abs(b["beta0"] - a["beta0"])
+            db1 = abs(b["beta1"] - a["beta1"])
+
+            print(f"{row_names[key]:<8} | "
+                  f"{a[TREND_GRID_RMSE_KEY]:<20.6f} | {a['beta0']:<10.4f} | {a['beta1']:<10.4f} | "
+                  f"{b[TREND_GRID_RMSE_KEY]:<20.6f} | {b['beta0']:<10.4f} | {b['beta1']:<10.4f} | "
+                  f"{db0:<10.4f} | {db1:<10.4f}")
 
 if __name__ == "__main__":
     # ----- Choice Variables -----

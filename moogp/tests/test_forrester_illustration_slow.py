@@ -3,8 +3,11 @@ import matplotlib.pyplot as plt
 
 from moogp import forrester_illustration_slow as slow_mod
 from moogp.forrester_illustration import (
+    TREND_GRID_RMSE_KEY,
     plot_forrester_fit_side_by_side,
     plot_trend_recovery_two_designs,
+    print_predictive_table,
+    print_trend_comparison_table,
 )
 
 
@@ -85,6 +88,76 @@ def test_plot_forrester_fit_side_by_side_shares_y_axis_by_row():
     plt.close(fig)
 
 
+def test_print_trend_comparison_table_prints_all_outputs(capsys):
+    def make_results(offset):
+        outputs = []
+        for output_idx in range(3):
+            outputs.append(
+                {
+                    "output_idx": output_idx,
+                    "rows": {
+                        "ols": {
+                            TREND_GRID_RMSE_KEY: offset + output_idx + 0.1,
+                            "beta0": offset + output_idx + 1.0,
+                            "beta1": offset + output_idx + 2.0,
+                        },
+                        "moogp": {
+                            TREND_GRID_RMSE_KEY: offset + output_idx + 0.2,
+                            "beta0": offset + output_idx + 3.0,
+                            "beta1": offset + output_idx + 4.0,
+                        },
+                    },
+                }
+            )
+        return {
+            "trend_table": {
+                "output_idx": 2,
+                "rows": outputs[2]["rows"],
+                "outputs": outputs,
+            }
+        }
+
+    print_trend_comparison_table(make_results(0.0), make_results(10.0))
+    printed = capsys.readouterr().out
+
+    assert "Trend comparison for Output 1" in printed
+    assert "Trend comparison for Output 2" in printed
+    assert "Trend comparison for Output 3" in printed
+    assert "RMSE(f_grid)" in printed
+    assert "RMSPE" not in printed
+    assert printed.count("Trend comparison for Output") == 3
+
+
+def test_print_predictive_table_uses_standard_metric_labels(capsys):
+    metrics = {
+        "rmse_y": 1.0,
+        "rmse_f": 2.0,
+        "nrmse_y": 0.5,
+        "coverage_95_y": 0.95,
+        "width_95_y": 3.0,
+        "dss_y": 4.0,
+    }
+    results = {
+        "predictive": {
+            "moogp": {"train": metrics},
+            "mogp": None,
+            "ols": None,
+        }
+    }
+
+    print_predictive_table(results, "LHS")
+    printed = capsys.readouterr().out
+
+    assert "RMSE(y)" in printed
+    assert "RMSE(f)" in printed
+    assert "NRMSE(y)" in printed
+    assert "Coverage95(y)" in printed
+    assert "Width95(y)" in printed
+    assert "DSS(y)" in printed
+    assert "Pred RMSE" not in printed
+    assert "Rec RMSE" not in printed
+
+
 def test_run_forrester_illustration_slow_can_disable_mogp(monkeypatch, tmp_path):
     data = make_dummy_data()
     fit_calls = []
@@ -139,8 +212,8 @@ def test_run_forrester_illustration_slow_can_disable_mogp(monkeypatch, tmp_path)
             "trend_table": {
                 "output_idx": output_idx,
                 "rows": {
-                    "moogp": {"rmspe": 0.0, "beta0": 0.0, "beta1": 0.0},
-                    "ols": {"rmspe": 0.0, "beta0": 0.0, "beta1": 0.0},
+                    "moogp": {TREND_GRID_RMSE_KEY: 0.0, "beta0": 0.0, "beta1": 0.0},
+                    "ols": {TREND_GRID_RMSE_KEY: 0.0, "beta0": 0.0, "beta1": 0.0},
                 },
             },
         }

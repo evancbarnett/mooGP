@@ -75,6 +75,7 @@ def _make_model(X, Y, q, *, terms, orthogonal, learn_sigma_eps=True,
         use_slow_kyinv=False,
         standardize_y=False,
         use_analytical_grad=use_analytical_grad,
+        standardize_x=False,
     )
     model._prepare_data({"X_scaled": X, "y": Y})
     return model

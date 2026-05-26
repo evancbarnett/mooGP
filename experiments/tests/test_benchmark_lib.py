@@ -430,7 +430,8 @@ def test_fit_method_local_puq_returns_prediction_bundle(tmp_path: Path, monkeypa
             x = np.asarray(x, dtype=float)
             mean = np.full((self._p, x.shape[0]), 0.5, dtype=float)
             var = np.full((self._p, x.shape[0]), 0.25, dtype=float)
-            return FakePUQPrediction({"mean": mean, "var": var})
+            nugs = np.full((self._p, x.shape[0]), 0.04, dtype=float)
+            return FakePUQPrediction({"mean": mean, "var": var, "nugs": nugs})
 
     fake_surrogate = types.ModuleType("PUQ.surrogate")
     fake_surrogate.emulator = FakePUQEmulator
@@ -455,6 +456,9 @@ def test_fit_method_local_puq_returns_prediction_bundle(tmp_path: Path, monkeypa
     assert prediction.std.shape == bundle.test_Y_true.shape
     assert prediction.cov is None
     assert np.all(prediction.std > 0.0)
+    # Predictive std must combine the mean-process variance and the
+    # observation-noise (nugget): sqrt(var + nugs) = sqrt(0.25 + 0.04).
+    assert np.allclose(prediction.std, np.sqrt(0.29))
 
 
 def test_fit_method_local_puq_raises_with_install_hint_when_missing(tmp_path: Path, monkeypatch):
@@ -583,9 +587,9 @@ def test_fit_method_local_moogp_uses_standardized_y_for_sigma_init(tmp_path: Pat
     captured: dict[str, np.ndarray | str] = {}
     original_append = benchmark_lib.append_sigma_eps_theta0_and_bounds
 
-    def capture_append(theta0, bounds, y_train):
+    def capture_append(theta0, bounds, y_train, diag_error_structure=None):
         captured["y_train_arg"] = np.asarray(y_train, dtype=float).copy()
-        return original_append(theta0, bounds, y_train)
+        return original_append(theta0, bounds, y_train, diag_error_structure=diag_error_structure)
 
     def fake_fit(self, data, theta0, bounds=None, optimizer_opts=None):
         self.opt_result = SimpleNamespace(success=True, message="")
@@ -629,9 +633,9 @@ def test_fit_method_local_mogp_uses_standardized_y_for_sigma_init(tmp_path: Path
     captured: dict[str, np.ndarray | str] = {}
     original_append = benchmark_lib.append_sigma_eps_theta0_and_bounds
 
-    def capture_append(theta0, bounds, y_train):
+    def capture_append(theta0, bounds, y_train, diag_error_structure=None):
         captured["y_train_arg"] = np.asarray(y_train, dtype=float).copy()
-        return original_append(theta0, bounds, y_train)
+        return original_append(theta0, bounds, y_train, diag_error_structure=diag_error_structure)
 
     captured_models: list[object] = []
     from moogp.model import MOOGP as _RealMOOGP
@@ -723,8 +727,11 @@ def test_run_single_method_local_uses_predictor_train_time_and_keeps_metrics_out
     )
     bundle = build_dataset_bundle(function="borehole", n=8, p=3, n_test=5, seed_data=123)
 
+    p_cols = bundle.test_Y_true.shape[1]
     predictor = FittedPredictor(
-        predict_fn=lambda Xstar: PredictionBundle(mean=np.zeros_like(bundle.test_Y_true)),
+        predict_fn=lambda Xstar: PredictionBundle(
+            mean=np.zeros((np.asarray(Xstar).shape[0], p_cols), dtype=float),
+        ),
         status="ok",
         error="",
         train_time_sec=1.25,

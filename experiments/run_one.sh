@@ -17,6 +17,8 @@
 #   MOOGP_PYTHON        Python executable that can import the experiments
 #                       package. Defaults to $MOOGP_REPO_ROOT/.venv/bin/python.
 #   MOOGP_SKIP_EXISTING If set to "1", skip cells whose CSV already exists.
+#   MOOGP_THREADS       If set, fill unset BLAS/OpenMP/NumExpr/vecLib/TensorFlow
+#                       thread variables with this per-process thread budget.
 #
 # Example (local, GNU parallel, 6-way):
 #   MOOGP_CONFIG=results/config.json \
@@ -45,6 +47,21 @@ config_path="${MOOGP_CONFIG:?MOOGP_CONFIG must point to the saved ExperimentConf
 output_dir="${MOOGP_OUTPUT_DIR:?MOOGP_OUTPUT_DIR must point to the per-job output directory.}"
 
 cd "$repo_root"
+
+if [[ -n "${MOOGP_THREADS:-}" ]]; then
+    if [[ ! "$MOOGP_THREADS" =~ ^[1-9][0-9]*$ ]]; then
+        echo "MOOGP_THREADS must be a positive integer, got '$MOOGP_THREADS'." >&2
+        exit 2
+    fi
+    export OMP_NUM_THREADS="${OMP_NUM_THREADS:-$MOOGP_THREADS}"
+    export MKL_NUM_THREADS="${MKL_NUM_THREADS:-$MOOGP_THREADS}"
+    export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-$MOOGP_THREADS}"
+    export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-$MOOGP_THREADS}"
+    export VECLIB_MAXIMUM_THREADS="${VECLIB_MAXIMUM_THREADS:-$MOOGP_THREADS}"
+    export TF_NUM_INTRAOP_THREADS="${TF_NUM_INTRAOP_THREADS:-$MOOGP_THREADS}"
+    export TF_NUM_INTEROP_THREADS="${TF_NUM_INTEROP_THREADS:-$MOOGP_THREADS}"
+fi
+
 if [[ "${MOOGP_SKIP_EXISTING:-0}" == "1" ]]; then
     exec "$python_bin" -m experiments.run_one \
         --config "$config_path" \

@@ -27,6 +27,7 @@ from .benchmark_lib import (
     ExperimentConfig,
     SUPPORTED_FUNCTIONS,
     SUPPORTED_METHODS,
+    VAH_GROUPING_CHOICES,
     emit_job_list,
     run_benchmarks,
 )
@@ -74,7 +75,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--n-test",
         type=int,
         default=250,
-        help="Number of test points per benchmark cell.",
+        help="Number of test points per benchmark cell (ignored for vah_nuclear).",
+    )
+    parser.add_argument(
+        "--n-folds",
+        type=int,
+        default=5,
+        help="Number of CV folds for the vah_nuclear function (rep selects the fold).",
+    )
+    parser.add_argument(
+        "--vah-grouping",
+        choices=VAH_GROUPING_CHOICES,
+        default="index",
+        help=(
+            "Diagonal error grouping for vah_nuclear: 'index' uses the groups in "
+            "all_f_index.csv (passed to MOOGP/MOGP/LCGP); 'none' fits one noise "
+            "per output. Ignored by OILMM and PUQ."
+        ),
     )
     parser.add_argument(
         "--q",
@@ -187,6 +204,8 @@ def main() -> int:
         moogp_python=args.moogp_python,
         oilmm_python=args.oilmm_python,
         puq_python=args.puq_python,
+        n_folds=args.n_folds,
+        vah_grouping=args.vah_grouping,
     )
 
     if args.emit_jobs is not None:

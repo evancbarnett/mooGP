@@ -41,6 +41,40 @@ def _make_config(tmp_path: Path) -> ExperimentConfig:
     )
 
 
+def test_iter_job_cells_for_vah_honors_reps_capped_by_n_folds():
+    base = dict(
+        functions=("vah_nuclear",),
+        methods=("MOOGP", "LCGP"),
+        sample_sizes=(0,),
+        output_dims=(0,),
+        n_test=0,
+        q=2,
+        maxiter=5,
+        jitter=1e-6,
+        noise_var_frac=1e-2,
+        use_fast=True,
+        jobs=1,
+        base_seed=1,
+        results_dir=Path("."),
+        n_folds=5,
+    )
+
+    # --reps below n_folds: only those folds are emitted.
+    config = ExperimentConfig(reps=2, **base)
+    cells = list(iter_job_cells(config))
+    reps_seen = sorted({rep for _, _, _, _, rep in cells})
+    assert reps_seen == [1, 2]
+    assert len(cells) == len(reps_seen) * len(config.methods)
+
+    # --reps equal to n_folds: full CV.
+    cells_full = list(iter_job_cells(ExperimentConfig(reps=5, **base)))
+    assert sorted({rep for _, _, _, _, rep in cells_full}) == [1, 2, 3, 4, 5]
+
+    # --reps above n_folds: silently clamped to n_folds.
+    cells_clamp = list(iter_job_cells(ExperimentConfig(reps=10, **base)))
+    assert sorted({rep for _, _, _, _, rep in cells_clamp}) == [1, 2, 3, 4, 5]
+
+
 def test_iter_job_cells_visits_full_grid_once():
     config = ExperimentConfig(
         functions=("borehole",),
@@ -308,3 +342,53 @@ def test_run_one_sh_invokes_python_module_with_correct_args(tmp_path: Path):
     assert "--rep" in recorded and recorded[recorded.index("--rep") + 1] == "1"
     assert "--output-dir" in recorded
     assert recorded[recorded.index("--output-dir") + 1] == str(output_dir)
+
+
+def test_run_one_sh_sets_thread_env_when_moogp_threads_requested(tmp_path: Path):
+    """MOOGP_THREADS should provide a simple per-process thread budget."""
+
+    fake_python = tmp_path / "fake-python"
+    log_path = tmp_path / "env.json"
+    names = [
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "TF_NUM_INTRAOP_THREADS",
+        "TF_NUM_INTEROP_THREADS",
+    ]
+    fake_python.write_text(
+        "#!/usr/bin/env bash\n"
+        "python3 -c \"import json, os; "
+        f"names={names!r}; "
+        f"json.dump({{name: os.environ.get(name) for name in names}}, open(r'{log_path}', 'w'))\" \"$@\"\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    output_dir = tmp_path / "jobs"
+
+    repo_root = Path(__file__).resolve().parents[2]
+    script = repo_root / "experiments" / "run_one.sh"
+
+    env = {
+        "PATH": "/usr/bin:/bin:/usr/local/bin",
+        "MOOGP_REPO_ROOT": str(repo_root),
+        "MOOGP_PYTHON": str(fake_python),
+        "MOOGP_CONFIG": str(config_path),
+        "MOOGP_OUTPUT_DIR": str(output_dir),
+        "MOOGP_THREADS": "4",
+    }
+    subprocess.run(
+        [str(script), "run_xyz", "borehole", "MOOGP", "50", "4", "1"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    recorded = json.loads(log_path.read_text(encoding="utf-8"))
+    assert recorded == {name: "4" for name in names}

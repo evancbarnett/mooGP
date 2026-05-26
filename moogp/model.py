@@ -1133,6 +1133,12 @@ class MOOGP:
             Ky_inv_rvec = solve_Ky(rvec)
             qf = np.dot(rvec, Ky_inv_rvec)
         nll = 0.5 * (logdetK + qf + (n * p) * np.log(2.0 * np.pi))
+        # Normalize to per-row NLL (mirrors LCGP's ``neglpost /= n``). The
+        # converged hyperparameters are invariant under positive rescaling
+        # of the objective; this only keeps the L-BFGS-B function value and
+        # its gradient O(1) regardless of dataset size, so a single set of
+        # ``ftol`` / ``gtol`` defaults is meaningful across the sweep.
+        nll = nll / float(n)
 
         if self.use_reml:
             A = None  # you can fill in REML here later
@@ -1373,7 +1379,11 @@ class MOOGP:
             base = q * (d + 1)
             grad_theta[base:base + n_groups] = grad_sigma
 
-        return float(nll), grad_theta
+        # Match the ``_nll`` per-row normalization: scale both the value and
+        # the gradient by 1/n so the analytical-grad path stays bit-equivalent
+        # to ``value_and_grad(_nll)``.
+        inv_n = 1.0 / float(n)
+        return float(nll) * inv_n, grad_theta * inv_n
 
     def fit(self, data, theta0, bounds=None, optimizer_opts=None):
         """

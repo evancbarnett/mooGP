@@ -35,6 +35,8 @@ def test_moogp_borehole_small_q_equals_p():
         learn_sigma_eps=False,
         use_reml=False,
         jitter=1e-8,
+        standardize_x=False,
+        standardize_y=False,
     )
 
     model.fit(data=data, theta0=theta0, bounds=bounds,

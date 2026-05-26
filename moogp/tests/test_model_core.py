@@ -102,6 +102,8 @@ def test_diagonalized_interaction_fast_matches_general():
         jitter=0.0,
         one_based=True,
         use_diagonalized_interaction=False,
+        standardize_x=False,
+        standardize_y=False,
     )
     model_general._prepare_data(data)
     nll_general = model_general._nll(theta)
@@ -116,6 +118,8 @@ def test_diagonalized_interaction_fast_matches_general():
         jitter=0.0,
         one_based=True,
         use_diagonalized_interaction=True,
+        standardize_x=False,
+        standardize_y=False,
     )
     model_fast._prepare_data(data)
     nll_fast = model_fast._nll(theta)
@@ -167,6 +171,8 @@ def test_fast_path_is_default_and_caches_kyinv_rvec():
         learn_sigma_eps=False,
         jitter=0.0,
         one_based=True,
+        standardize_x=False,
+        standardize_y=False,
     )
     model._prepare_data(data)
     model._nll(theta)
@@ -212,6 +218,8 @@ def test_predict_mean_uses_cached_kyinv_rvec():
         learn_sigma_eps=False,
         jitter=0.0,
         one_based=True,
+        standardize_x=False,
+        standardize_y=False,
     )
     model._prepare_data(data)
     model._nll(theta)
@@ -265,6 +273,8 @@ def test_apply_factorized_qk_matches_explicit_solve():
         jitter=0.0,
         one_based=True,
         use_diagonalized_interaction=True,
+        standardize_x=False,
+        standardize_y=False,
     )
     model._prepare_data({"X_scaled": X, "Y": Y})
     model._nll(theta)
@@ -297,6 +307,7 @@ def test_profiled_gls_terms_match_dense_formulas_and_non_caching_path():
         one_based=True,
         use_diagonalized_interaction=True,
         standardize_y="zscore",
+        standardize_x=False,
     )
     model._prepare_data(data)
 

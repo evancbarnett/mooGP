@@ -30,6 +30,8 @@ def test_learn_psi():
         jitter=1e-6,
         one_based=True,
         normalize_cols=True,
+        standardize_x=False,
+        standardize_y=False,
     )
 
     # Prepare internal X/Y/n/d/p
