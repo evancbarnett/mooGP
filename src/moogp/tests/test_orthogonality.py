@@ -79,7 +79,7 @@ def test_cstar_orthogonal_to_intercept():
     Cstar = make_c_star_matrix(X, X, ell=ell, sigma2=sigma2, terms=terms)
 
     # Approximating \int_{-1}^1 c(x,x') via trapezoidal rule
-    I0 = np.trapz(Cstar, x=X[:,0], axis=0)
+    I0 = np.trapezoid(Cstar, x=X[:,0], axis=0)
     assert np.max(np.abs(I0)) < 1e-3
 
 
@@ -94,10 +94,10 @@ def test_cstar_orthogonal_to_intercept_and_linear():
     Cstar = make_c_star_matrix(X, X, ell=ell, sigma2=sigma2, terms=terms)
 
     # \int c(x,x')
-    I0 = np.trapz(Cstar, x=xs, axis=0)
+    I0 = np.trapezoid(Cstar, x=xs, axis=0)
     
     # \int x * c(x,x')
-    I1 = np.trapz(Cstar * xs[:, None], x=xs, axis=0)
+    I1 = np.trapezoid(Cstar * xs[:, None], x=xs, axis=0)
 
     assert np.max(np.abs(I0)) < 1e-3
     assert np.max(np.abs(I1)) < 1e-3
@@ -114,15 +114,15 @@ def _numeric_h_and_H_full(X_row, ell, sigma2, terms, grid_n=401):
     for j in range(d):
         grid = np.linspace(-1.0, 1.0, grid_n)
         kernel_x = np.exp(-((x[j] - grid) / ell[j]) ** 2)
-        h0 = np.trapz(kernel_x, x=grid)
-        h1 = np.trapz(grid * kernel_x, x=grid)
+        h0 = np.trapezoid(kernel_x, x=grid)
+        h1 = np.trapezoid(grid * kernel_x, x=grid)
         h_moments.append((h0, h1))
 
         K = np.exp(-((grid[:, None] - grid[None, :]) / ell[j]) ** 2)
-        H00 = np.trapz(np.trapz(K, x=grid, axis=0), x=grid)
-        H10 = np.trapz(np.trapz(grid[:, None] * K, x=grid, axis=0), x=grid)
-        H01 = np.trapz(np.trapz(K * grid[None, :], x=grid, axis=0), x=grid)
-        H11 = np.trapz(np.trapz(grid[:, None] * K * grid[None, :], x=grid, axis=0), x=grid)
+        H00 = np.trapezoid(np.trapezoid(K, x=grid, axis=0), x=grid)
+        H10 = np.trapezoid(np.trapezoid(grid[:, None] * K, x=grid, axis=0), x=grid)
+        H01 = np.trapezoid(np.trapezoid(K * grid[None, :], x=grid, axis=0), x=grid)
+        H11 = np.trapezoid(np.trapezoid(grid[:, None] * K * grid[None, :], x=grid, axis=0), x=grid)
         H_moments.append(np.array([[H00, H01], [H10, H11]], dtype=float))
 
     h = []
