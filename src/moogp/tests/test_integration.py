@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from moogp.datasets import generate_borehole_data_nd
-from moogp.model import MOOGP
+from src.moogp.datasets import generate_borehole_data_nd
+from src.moogp.model import MOOGP
 
 
 def test_moogp_borehole_fit_and_predict():

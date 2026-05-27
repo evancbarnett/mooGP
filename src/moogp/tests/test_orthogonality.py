@@ -1,12 +1,11 @@
 import numpy as np
 from scipy.integrate import quad
 
-from moogp.design import parse_terms_to_index_sets
-from moogp.kernels import (
+from src.moogp.design import parse_terms_to_index_sets
+from src.moogp.kernels import (
     M_gauss,
     L_gauss,
     IM_gauss,
-    IL_gauss,
     ILL_gauss,
     make_c_star_matrix,
     se_kernel_matrix,

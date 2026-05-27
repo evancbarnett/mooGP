@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 from autograd import value_and_grad
 
-from moogp.model import (
+from src.moogp.model import (
     MOOGP,
     aggregate_per_output_to_groups,
     expand_grouped_sigma_eps2,

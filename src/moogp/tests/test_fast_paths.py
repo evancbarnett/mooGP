@@ -28,7 +28,7 @@ from autograd import grad as ag_grad, value_and_grad
 from autograd.numpy import exp, pi, sqrt
 from scipy.linalg import cho_factor, cho_solve
 
-from moogp.design import (
+from src.moogp.design import (
     _parse_terms_cached,
     _parse_terms_impl,
     build_Gy,
@@ -37,7 +37,7 @@ from moogp.design import (
     unvecF,
     vecF,
 )
-from moogp.kernels import (
+from src.moogp.kernels import (
     H_diag_se,
     L_gauss,
     M_gauss,
@@ -46,7 +46,7 @@ from moogp.kernels import (
     make_c_star_matrix,
     se_kernel_matrix,
 )
-from moogp.model import (
+from src.moogp.model import (
     MOOGP,
     _latent_kernel_logtheta_grad,
     _predict_variance_diag_fast,

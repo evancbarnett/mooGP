@@ -1,8 +1,8 @@
 import numpy as np
 from numpy.linalg import cholesky
 
-from moogp.design import build_Gy, vecF
-from moogp.model import (
+from src.moogp.design import build_Gy, vecF
+from src.moogp.model import (
     MOOGP,
     _apply_factorized_qk,
     _block_design_matvec,
