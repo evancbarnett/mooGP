@@ -48,5 +48,7 @@ experiments/_diag_*.json
 .DS_Store
 .vscode/
 
-# MOOGP research files
+# MOOGP research/experimental files
 moogp/figs/
+experiments/thread_diagnostics.py
+notebooks/
