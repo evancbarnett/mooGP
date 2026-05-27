@@ -36,6 +36,9 @@ results-*/
 results_*/
 *_results/
 
+# OGP files
+ogp/
+
 # Scratch diagnostics
 experiments/_diag_*.json
 
