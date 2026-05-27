@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from moogp.datasets import generate_forrester_data, log_lhs_1d_rescaled
-from moogp.forrester_illustration import (
+from forrester_illustration import (
     FORRESTER_MANUSCRIPT_SIGMA_EPS2,
     evaluate_moogp,
     fit_moogp_forrester,

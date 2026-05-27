@@ -9,10 +9,10 @@ from typing import TYPE_CHECKING, Any, Sequence
 
 import numpy as np
 
-from .evaluation import dss, intervalstats, normalized_rmse, rmse
+from moogp.evaluation import dss, intervalstats, normalized_rmse, rmse
 
 if TYPE_CHECKING:
-    from .model import MOOGP
+    from moogp.model import MOOGP
 
 
 DEFAULT_NUCLEAR_OUTPUT_BLOCKS: tuple[tuple[int, int | None], ...] = (

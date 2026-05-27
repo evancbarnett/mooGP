@@ -1,14 +1,13 @@
-# moogp/main_borehole_example.py
 import time
 import numpy as np
 from scipy.stats import qmc
 
-from .datasets import (
+from moogp.datasets import (
     generate_borehole_data_nd,
     tstd2theta,
     borehole_vec_physical,
 )
-from .model import MOOGP
+from moogp.model import MOOGP
 
 if __name__ == "__main__":
     # 1) data
