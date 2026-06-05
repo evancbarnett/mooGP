@@ -4,7 +4,7 @@ authors = [
   {name = "Evan C. Barnett", email = "evanbarnett2027@u.northwestern.edu"},
   {name = "Moses Y.-H. Chan", email = "moses.chan@northwestern.edu"},
 ]
-version = "0.9.0"
+version = "0.9.1"
 description = "Multioutput orthogonal Gaussian process"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -13,6 +13,15 @@ dependencies = [
     "numpy>=2.0.0",
     "scipy>=1.16.0",
     "pytest>=9.0.3",
+]
+license = "GPL-3.0-only"
+keywords = ["emulator", "gaussian process", "calibration", "statistics", "surrogate"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
 ]
 
 [dependency-groups]
