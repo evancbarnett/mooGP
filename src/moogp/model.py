@@ -240,7 +240,6 @@ def init_phi(Y, q, n):
     Build ``Phi`` and ``d`` from the SVD of ``Y``.
     """
     Y = np.asarray(Y, float)
-    p = Y.shape[1]
     
     # SVD of Y returns U: (n,n), S: (min(n,p)), Vt: (p,p)
     _, svals, Vt = np.linalg.svd(Y, full_matrices=False)
@@ -1089,7 +1088,7 @@ class MOOGP:
                 sigma_eps2=sigma_eps2
             )
 
-            solve_Ky = lambda rhs: self._apply_Ky_inv_fast(rhs, fast_diag_info)
+            def solve_Ky(rhs): return self._apply_Ky_inv_fast(rhs, fast_diag_info)
             Psi_cache = (np.sqrt(sigma_eps2)[:, None] * Phi) if build_cache else None
         else:
             Ky = build_Ky(Cj_list, Psi, sigma_eps2=sigma_eps2)
@@ -1097,7 +1096,7 @@ class MOOGP:
                 Ky = Ky + self.jitter * np.eye(n * p)
             Ky_chol = cho_factor(Ky, lower=True, check_finite=False)
             logdetK = 2.0 * np.sum(np.log(np.diag(Ky_chol[0])))
-            solve_Ky = lambda rhs: cho_solve(Ky_chol, rhs, check_finite=False)
+            def solve_Ky(rhs): return cho_solve(Ky_chol, rhs, check_finite=False)
             Psi_cache = Psi
 
         vecY = vecF(Y)
@@ -1402,7 +1401,7 @@ class MOOGP:
         """
         self._prepare_data(data)
 
-        obj = lambda th: self._nll(th)
+        def obj(th): return self._nll(th)
 
         use_fast = (
             self.use_diagonalized_interaction

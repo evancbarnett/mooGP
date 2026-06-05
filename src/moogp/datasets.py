@@ -1,7 +1,6 @@
 # moogp/datasets.py
 
 import numpy as np
-from numpy import pi, exp
 from scipy.stats import qmc
 
 def tstd2theta(tstd, hard=True):
@@ -97,7 +96,7 @@ def generate_forrester_data(n, seed=67, with_error=False, error_per_output=None,
 
     if with_error:
         if error_per_output is None:
-            raise ValueError(f"Specify error_per_output if with_error = True")
+            raise ValueError("Specify error_per_output if with_error = True")
         else:
             error_per_output = np.asarray(error_per_output, dtype=float).ravel()
             if error_per_output.size == 1:
