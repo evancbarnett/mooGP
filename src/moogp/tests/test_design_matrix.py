@@ -1,6 +1,6 @@
 import numpy as np
 import pytest
-from numpy.testing import assert_array_equal, assert_array_almost_equal
+from numpy.testing import assert_array_equal  #, assert_array_almost_equal
 
 from src.moogp.design import make_G, build_Gy, vecF, unvecF
 

@@ -94,7 +94,7 @@ def test_compute_x_center_scale_constant_column_does_not_divide_by_zero():
 def _toy_two_output_problem(seed: int = 0):
     rng = np.random.default_rng(seed)
     # Raw X in an awkward range to confirm internal scaling cleans it up.
-    n, d, p = 25, 2, 2
+    n, d, _ = 25, 2, 2
     X_raw = rng.uniform(low=-3.0, high=7.0, size=(n, d))
     Y_raw = np.column_stack(
         [

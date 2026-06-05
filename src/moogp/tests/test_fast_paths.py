@@ -25,7 +25,6 @@ import autograd.numpy as anp
 import numpy as np
 import pytest
 from autograd import grad as ag_grad, value_and_grad
-from autograd.numpy import exp, pi, sqrt
 from scipy.linalg import cho_factor, cho_solve
 
 from src.moogp.design import (
@@ -319,7 +318,7 @@ class TestProfiledGLSFast:
         vecY = vecF(model.Y)
         n = X.shape[0]
 
-        solve_Ky = lambda rhs: model._apply_Ky_inv_fast(rhs, fast_info)
+        def solve_Ky(rhs): return model._apply_Ky_inv_fast(rhs, fast_info)
         qf_ref, b_ref, r_ref, kir_ref = _profiled_gls_terms(
             solve_Ky, G, Gy, vecY, p, build_cache=True
         )
