@@ -1,6 +1,6 @@
 from importlib.metadata import version, PackageNotFoundError
 
-from .test import test
+from .test import test as test
 
 try:
     __version__ = version("moogp")
