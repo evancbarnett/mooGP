@@ -17,6 +17,7 @@ This script:
 
 python -m moogp.sigma_eps_demo
 """
+
 from __future__ import annotations
 
 import numpy as np
@@ -42,8 +43,6 @@ def true_functions(X: np.ndarray) -> np.ndarray:
     f3 = 0.4 * np.sin(2 * np.pi * x) - 0.15 * f1
     return np.vstack([f1, f2, f3]).T
 
-
-import numpy as np
 
 def make_theta0_and_bounds(
     q: int,

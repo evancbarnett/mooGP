@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 from moogp.design import make_G
 from moogp.datasets import generate_forrester_data, log_lhs_1d_rescaled
 from moogp.model import MOOGP
-from moogp.evaluation import *
+from moogp.evaluation import rmse, normalized_rmse, intervalstats, dss
 from pathlib import Path
 
 def get_model_trend_betas_raw(model):
@@ -449,7 +449,6 @@ def plot_forrester_fit_side_by_side(
         for j in range(p):
             # -------- Left column (LHS) --------
             axL = axes[j, 0]
-            add_labels_L = False  # keep legend only on the designated axis
 
             axL.scatter(X_lhs[:, 0], Y_lhs[:, j], s=18, color="black", alpha=alpha, linewidths=0.0,
                         label="Training data" if axL is legend_ax else None, zorder=5)
@@ -688,7 +687,7 @@ def plot_trend_recovery_two_designs(
 def plot_pred_vs_true(model, n_test=50, seed=123):
     # Generate a test set
     data_test = generate_forrester_data(n=n_test, seed=seed)
-    X_test = data_test["X"]
+    # X_test = data_test["X"]
     X_test_scaled = data_test["X_scaled"]
     Y_test_true = data_test["y"]
 
