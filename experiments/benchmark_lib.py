@@ -212,7 +212,7 @@ def extract_optimizer_diagnostics(opt_result: Any) -> dict[str, int | None]:
     if isinstance(opt_result, dict):
         getter = opt_result.get
     else:
-        getter = lambda name: getattr(opt_result, name, None)
+        def getter(name): return getattr(opt_result, name, None)
 
     return {
         name: _coerce_optional_int(getter(name))
