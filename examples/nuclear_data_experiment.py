@@ -199,29 +199,6 @@ def make_block_specs(
     return specs
 
 
-def build_theta0_bounds(Y: np.ndarray, q: int, d: int) -> tuple[np.ndarray, list[tuple[float, float]]]:
-    """Construct latent-kernel and noise initial values for the fast MOOGP fit."""
-
-    theta0: list[float] = []
-    bounds: list[tuple[float, float]] = []
-    for _ in range(q):
-        theta0.append(float(np.log(1.0)))
-        theta0.extend([float(np.log(0.5))] * d)
-
-        bounds.append((float(np.log(1e-3)), float(np.log(1e3))))
-        bounds.extend([(float(np.log(0.05)), float(np.log(5.0)))] * d)
-
-    y_var = np.maximum(np.var(Y, axis=0, ddof=1), 1e-12)
-    sigma_eps2_init = np.log(np.maximum(1e-12, 1e-2 * y_var))
-    theta0.extend(sigma_eps2_init.tolist())
-
-    lb = np.maximum(1e-12, 1e-6 * y_var)
-    ub = np.maximum(lb * 10.0, 0.5 * y_var)
-    bounds.extend([(float(np.log(lbi)), float(np.log(ubi))) for lbi, ubi in zip(lb, ub)])
-
-    return np.asarray(theta0, dtype=float), bounds
-
-
 def compute_predictive_metrics(
     y_true: np.ndarray,
     y_pred: np.ndarray,
@@ -265,14 +242,13 @@ def fit_fast_nuclear_block(
 ) -> "MOOGP":
     """Fit a fast-path MOOGP model for one output block."""
 
-    from .model import MOOGP
+    from moogp.model import MOOGP
 
     X_train_scaled = np.asarray(X_train_scaled, dtype=float)
     Y_train = np.asarray(Y_train, dtype=float)
     _, d = X_train_scaled.shape
 
     terms = [None] + list(range(1, d + 1))
-    theta0, bounds = build_theta0_bounds(Y_train, q=q, d=d)
 
     model = MOOGP(
         terms=terms,
@@ -286,10 +262,12 @@ def fit_fast_nuclear_block(
         use_diagonalized_interaction=True,
         standardize_y=standardize_y,
     )
+    # theta0 / bounds omitted: MOOGP.fit derives a data-aware initialization from
+    # the standardized working-scale data. (The previous build_theta0_bounds
+    # helper seeded sigma_eps from the *raw* Y variance, which disagreed with the
+    # model's internal zscore standardization; the in-model init fixes that.)
     model.fit(
         data={"X_scaled": X_train_scaled, "Y": Y_train},
-        theta0=theta0,
-        bounds=bounds,
         optimizer_opts={"maxiter": maxiter},
     )
     return model

@@ -1,4 +1,5 @@
 import autograd.numpy as np
+import numpy as onp  # real numpy for non-traced theta0/bounds construction
 
 from autograd.scipy.linalg import solve_triangular as ag_solve_triangular
 from scipy.linalg import cho_factor, cho_solve, solve, solve_triangular
@@ -685,6 +686,17 @@ class MOOGP:
     """
     Multi-output Orthogonal Gaussian Process Model
     """
+
+    # Default box bounds used by :meth:`_default_theta0_and_bounds` when the
+    # caller does not pass explicit ``theta0`` / ``bounds`` to :meth:`fit`.
+    # They assume X is standardized to ~[-1, 1] (the default ``standardize_x``)
+    # and match the production benchmark init. Override on an instance or
+    # subclass to widen/narrow the search box without hand-building bounds.
+    DEFAULT_LATENT_SIGMA2_BOUNDS = (1e-3, 1e6)   # latent kernel variance sigma^2_k
+    DEFAULT_LATENT_ELL_BOUNDS = (0.05, 100.0)    # latent length-scales ell_{k,j}
+    DEFAULT_PSI_BOUNDS = (-5.0, 5.0)             # free Psi entries (learn_Psi=True)
+    DEFAULT_SIGMA_EPS2_LB_FRAC = 1e-6            # noise lower bound = frac * Var(Y)
+    DEFAULT_SIGMA_EPS2_UB_FRAC = 0.5             # noise upper bound = frac * Var(Y)
 
     def __init__(self,
                  terms,
@@ -1384,7 +1396,97 @@ class MOOGP:
         inv_n = 1.0 / float(n)
         return float(nll) * inv_n, grad_theta * inv_n
 
-    def fit(self, data, theta0, bounds=None, optimizer_opts=None):
+    def _default_theta0_and_bounds(self):
+        """Data-aware initial hyperparameters and box bounds for :meth:`fit`.
+
+        Built automatically from the prepared working-scale data so callers do
+        not have to hand-construct ``theta0`` / ``bounds``. Must be called after
+        :meth:`_prepare_data` (``self.X`` / ``self.Y`` hold the working-scale
+        arrays, ``self.diag_error_structure`` is resolved).
+
+        The packing matches :func:`unpack_theta`:
+
+          1. latent kernel block of length ``q * (d + 1)`` (always),
+          2. ``Psi`` block of length ``p * q`` (only when ``learn_Psi``),
+          3. ``Sigma_eps`` block of ``len(diag_error_structure)`` log-variances
+             (only when ``learn_sigma_eps``).
+
+        Seeds mirror LCGP's ``init_params`` (and the previous external
+        ``make_data_aware_theta0_and_bounds`` benchmark helper):
+
+        * latent ``sigma^2_k = s_k^2 / n`` from the singular values of
+          ``Y_work`` (undoes the ``Phi`` SVD normalization in the fast path),
+        * length-scales ``ell_{k,j} = exp(0.5*log(d) + log(std(X_work[:, j])))``
+          (the ``sqrt(d) * std(X)`` heuristic, shared across latents),
+        * ``Psi`` (if learned) from the leading right singular vectors of
+          ``Y_work`` (column normalization makes only their direction matter),
+        * ``sigma^2_eps`` from the per-group variance of the rank-``q`` SVD
+          reconstruction residual of ``Y_work`` (a data-implied noise floor).
+
+        All seeds are clipped strictly inside the box so L-BFGS-B starts
+        feasible. Uses real numpy (not autograd) since this is never traced.
+        """
+        q, d, p, n = self.q, self.d, self.p, self.n
+        X_work = onp.asarray(self.X, dtype=float)
+        Y_work = onp.asarray(self.Y, dtype=float)
+
+        U, svals, Vt = onp.linalg.svd(Y_work, full_matrices=False)
+        s_q = onp.maximum(svals[:q], 1e-12)
+        s2_k = (s_q ** 2) / float(n)  # = 1 / d_vals in init_phi
+
+        std_x = onp.std(X_work, axis=0)
+        std_x = onp.where(std_x > 1e-12, std_x, 1.0)
+        log_ell = 0.5 * onp.log(d) + onp.log(std_x)  # shared across latents
+
+        theta0: list[float] = []
+        bounds: list[tuple[float, float]] = []
+
+        # 1. Latent kernel block: data-aware seeds + constant box.
+        sig2_lb, sig2_ub = self.DEFAULT_LATENT_SIGMA2_BOUNDS
+        ell_lb, ell_ub = self.DEFAULT_LATENT_ELL_BOUNDS
+        latent_box = [(float(onp.log(sig2_lb)), float(onp.log(sig2_ub)))] + (
+            [(float(onp.log(ell_lb)), float(onp.log(ell_ub)))] * d
+        )
+        for k in range(q):
+            theta0.append(float(onp.log(max(s2_k[k], 1e-8))))
+            theta0.extend(float(v) for v in log_ell)
+            bounds.extend(latent_box)
+
+        # 2. Optional Psi block (slow path; learn_Psi=True).
+        if self.learn_Psi:
+            Psi0 = onp.asarray(Vt[:q].T, dtype=float)  # (p, q), orthonormal columns
+            theta0.extend(float(v) for v in Psi0.ravel())
+            bounds.extend([tuple(self.DEFAULT_PSI_BOUNDS)] * (p * q))
+
+        # 3. Optional Sigma_eps block (learn_sigma_eps=True). When
+        #    ``diag_error_structure`` groups outputs, each group carries one
+        #    shared log-variance, so per-output seeds/bounds are collapsed to
+        #    per-group means (a no-op for the default [1]*p grouping).
+        if self.learn_sigma_eps:
+            sizes = onp.asarray(self.diag_error_structure, dtype=int)
+            bp = onp.concatenate([[0], onp.cumsum(sizes)[:-1]])
+
+            Y_hat = U[:, :q] @ onp.diag(svals[:q]) @ Vt[:q, :]
+            resid_var = onp.maximum(onp.var(Y_work - Y_hat, axis=0, ddof=1), 1e-12)
+            resid_var = onp.add.reduceat(resid_var, bp) / sizes
+            theta0.extend(float(v) for v in onp.log(resid_var))
+
+            y_var = onp.maximum(1e-12, onp.var(Y_work, axis=0, ddof=1))
+            y_var = onp.add.reduceat(y_var, bp) / sizes
+            lb = onp.maximum(1e-12, self.DEFAULT_SIGMA_EPS2_LB_FRAC * y_var)
+            ub = onp.maximum(lb * 10.0, self.DEFAULT_SIGMA_EPS2_UB_FRAC * y_var)
+            bounds.extend(
+                (float(onp.log(lbi)), float(onp.log(ubi))) for lbi, ubi in zip(lb, ub)
+            )
+
+        # Clip every seed strictly inside its box so L-BFGS-B starts feasible.
+        theta0_arr = onp.asarray(theta0, dtype=float)
+        lo = onp.array([b[0] for b in bounds], dtype=float)
+        hi = onp.array([b[1] for b in bounds], dtype=float)
+        theta0_arr = onp.minimum(onp.maximum(theta0_arr, lo), hi)
+        return theta0_arr, bounds
+
+    def fit(self, data, theta0=None, bounds=None, optimizer_opts=None):
         """
         Fit the model by ML (or REML placeholder) given data and initial hyperparameters.
 
@@ -1392,14 +1494,26 @@ class MOOGP:
         ----------
         data : dict
             Must contain 'X_scaled' (n,d) and 'Y' or 'y' (n,p).
-        theta0 : 1D array
-            Initial parameter vector (same packing as before).
+        theta0 : 1D array or None
+            Initial parameter vector (same packing as :func:`unpack_theta`).
+            When ``None`` (the default) a data-aware vector is built
+            automatically by :meth:`_default_theta0_and_bounds` so callers do
+            not have to set it explicitly.
         bounds : list of (low, high) or None
-            L-BFGS-B bounds.
+            L-BFGS-B bounds. When ``None`` (the default) the matching box bounds
+            from :meth:`_default_theta0_and_bounds` are used.
         optimizer_opts : dict or None
             Extra options passed to scipy.optimize.minimize.
         """
         self._prepare_data(data)
+
+        # Auto-build a data-aware theta0 / bounds when the caller omits either.
+        if theta0 is None or bounds is None:
+            default_theta0, default_bounds = self._default_theta0_and_bounds()
+            if theta0 is None:
+                theta0 = default_theta0
+            if bounds is None:
+                bounds = default_bounds
 
         def obj(th): return self._nll(th)
 

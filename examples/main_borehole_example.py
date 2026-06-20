@@ -26,15 +26,6 @@ if __name__ == "__main__":
     Psi = rng.standard_normal((p, q))
     Psi /= np.maximum(np.linalg.norm(Psi, axis=0, keepdims=True), 1e-12)
 
-    # 3) theta0 and bounds (same as before)
-    theta0 = []
-    bounds = []
-    for j in range(q):
-        theta0 += [np.log(1.0)]
-        theta0 += list(np.log(0.5) * np.ones(d))
-        bounds += [(np.log(1e-6), np.log(1e3))] + [(np.log(0.05), np.log(5.0))] * d
-    theta0 = np.array(theta0)
-
     model = MOOGP(
         terms=terms,
         q=q,
@@ -45,8 +36,11 @@ if __name__ == "__main__":
         jitter=1e-6,
     )
 
+    # 3) Fit. theta0 / bounds are optional: when omitted, MOOGP.fit builds a
+    # data-aware initialization (and matching box bounds) from the training
+    # data automatically. Pass them explicitly only to override the defaults.
     t0 = time.perf_counter()
-    model.fit(data=data, theta0=theta0, bounds=bounds)
+    model.fit(data=data)
     elapsed = time.perf_counter() - t0
 
     print(f"Training took {elapsed:.3f} s")
