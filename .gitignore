@@ -51,5 +51,6 @@ experiments/_diag_*.json
 
 # MOOGP research/experimental files
 src/moogp/figs/
+/moogp/
 experiments/thread_diagnostics.py
 notebooks/
