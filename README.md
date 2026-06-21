@@ -90,10 +90,10 @@ MOOGP(terms, q, Psi=None, *,
 | `orthogonal` | `True` | Orthogonalize the kernel against `g(x)`; `False` is a standard squared exponential kernel. |
 | `sigma_eps2` | `None` | Fixed per-output noise variances, shape `(p,)` ([section](#measurement-noise-and-diag_error_structure)).  |
 | `learn_sigma_eps` | auto | Learn the noise; defaults to `True` when `sigma_eps2` is not given. |
-| `diag_error_structure` | `None` | Group outputs that share one noise variance (see [below](#measurement-noise-and-diag_error_structure)). |
-| `standardize_x` | `"unitcube"` | Map inputs to `[-1, 1]` internally. |
+| `diag_error_structure` | `None` | Group outputs that share one noise variance ([section](#measurement-noise-and-diag_error_structure)). |
+| `standardize_x` | `"unitcube"` | Map inputs to `[-1, 1]` internally ([section](#standardization)). |
 | `standardize_y` | `"zscore"` | Center and scale outputs internally. |
-| `learn_Psi` | `False` | Learn the mixing matrix instead of deriving it from the data. |
+| `learn_Psi` | `False` | Learn the mixing matrix instead of deriving it from the data ([section](#kernel-and-mixing-matrix-options)). |
 
 
 ## Advanced Usage
