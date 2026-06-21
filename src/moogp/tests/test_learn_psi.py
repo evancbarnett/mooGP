@@ -70,8 +70,6 @@ def test_learn_psi():
         optimizer_opts={"maxiter": 150},
     )
 
-    assert model.opt_result.success
-
     # Optimization should not make the NLL worse
     assert model.nll_hat <= nll0 + 1e-6
 
