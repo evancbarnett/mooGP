@@ -17,6 +17,7 @@ dependencies = [
     "numpy>=2.0.0",
     "scipy>=1.16.0",
     "pytest>=9.0.3",
+    "ipykernel>=7.3.0",
 ]
 license = "GPL-3.0-only"
 keywords = ["emulator", "gaussian process", "calibration", "statistics", "surrogate"]
@@ -37,8 +38,6 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["moogp*"]
-exclude = ["moogp.tests*"]
 
 [tool.pytest.ini_options]
 testpaths = ["src/moogp/tests"]
