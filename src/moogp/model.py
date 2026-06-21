@@ -257,6 +257,37 @@ def init_phi(Y, q, n):
     return Phi, d
 
 
+def resolve_q_from_var_threshold(Y, var_threshold):
+    """Choose the number of latent GPs ``q`` from a target variance fraction.
+
+    Mirrors LCGP's selection rule: with the singular values
+    ``s_1 >= s_2 >= ...`` of ``Y``, pick the smallest ``q`` whose cumulative
+    spectral energy ``sum_{i<=q} s_i^2 / sum_i s_i^2`` strictly exceeds
+    ``var_threshold``.
+
+    Parameters
+    ----------
+    Y : (n, p) array
+        Outputs whose SVD determines the orthogonal basis. Singular values are
+        orientation-invariant, so this matches LCGP even though LCGP stores its
+        outputs transposed (``(p, n)``).
+    var_threshold : float
+        Target fraction of output variance to retain, in the open interval
+        ``(0, 1)``.
+
+    Returns
+    -------
+    int
+        The selected number of components ``q`` (``1 <= q <= min(n, p)``).
+    """
+    if not (0.0 < var_threshold < 1.0):
+        raise ValueError(f"var_threshold must lie in (0, 1); got {var_threshold}.")
+    Y = np.asarray(Y, float)
+    svals = np.linalg.svd(Y, compute_uv=False)
+    cumvar = np.cumsum(svals ** 2) / np.sum(svals ** 2)
+    return int(np.argmax(cumvar > var_threshold) + 1)
+
+
 def _normalize_standardize_y_mode(standardize_y):
     """Normalize user-facing output-standardization options."""
     if standardize_y in (False, None):
@@ -700,9 +731,10 @@ class MOOGP:
 
     def __init__(self,
                  terms,
-                 q,
+                 q=None,
                  Psi=None,
                  *,
+                 var_threshold=None,
                  orthogonal=True,
                  learn_Psi=False,
                  sigma_eps2=None,
@@ -725,8 +757,17 @@ class MOOGP:
         ----------
         terms : list
             Basis specification for g(x) (same as make_G).
-        q : int
-            Number of latent orthogonal GPs. (q <= p)
+        q : int or None
+            Number of latent orthogonal GPs (``q <= p``). May be left ``None``
+            and selected automatically from ``var_threshold`` instead; passing
+            both is an error. When both ``q`` and ``var_threshold`` are ``None``
+            the full rank ``q = p`` is used.
+        var_threshold : float or None
+            Target fraction of output variance (in ``(0, 1)``) the latent basis
+            should capture. When set (and ``q`` is ``None``), ``q`` is chosen as
+            the smallest number of leading singular directions of the
+            standardized ``Y`` whose cumulative spectral energy exceeds the
+            threshold. Mutually exclusive with ``q``.
         Psi : (p, q) array or None # TODO Change Psi arg options
             Initial / fixed mixing matrix. If learn_Psi=False, this must be provided.
             If learn_Psi=True, it's used for shape.
@@ -797,7 +838,12 @@ class MOOGP:
             ``standardize_x`` is disabled.
         """
         self.terms = terms
+        
+        if (q is not None) and (var_threshold is not None):
+            raise ValueError("Provide only one of `q` or `var_threshold`, not both.")
+        
         self.q = q
+        self.var_threshold = var_threshold
         self.Psi = None if Psi is None else np.asarray(Psi, float)
         self.orthogonal = orthogonal
         self.learn_Psi = learn_Psi
@@ -807,10 +853,6 @@ class MOOGP:
         if learn_sigma_eps is None:
             learn_sigma_eps = (self.sigma_eps2 is None)
         self.learn_sigma_eps = bool(learn_sigma_eps)
-
-        # Stored as-is; the data-dependent normalization (filling in the
-        # ``[1] * p`` default and verifying ``sum == p``) happens in
-        # ``_prepare_data`` once ``p`` is known.
         self._diag_error_structure_arg = diag_error_structure
         self.diag_error_structure = None
 
@@ -904,6 +946,13 @@ class MOOGP:
         self.d = d
         self.p = p
         self.Ky_inv_rvec_ = None
+
+        if self.q is None:
+            if self.var_threshold is None:
+                self.q = p
+            else:
+                self.q = resolve_q_from_var_threshold(Y, self.var_threshold)
+
         self.Psi_work = self._psi_to_working_scale(self.Psi)
         self.sigma_eps2_work = self._sigma_eps2_to_working_scale(self.sigma_eps2)
 

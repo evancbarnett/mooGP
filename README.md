@@ -77,8 +77,8 @@ print(f"Coverage:   {coverage}")
 ## The `MOOGP` Class
 
 ```python
-MOOGP(terms, q, Psi=None, *,
-      orthogonal=True, learn_Psi=False,
+MOOGP(terms, q=None, Psi=None, *,
+      var_threshold=None, orthogonal=True, learn_Psi=False,
       sigma_eps2=None, learn_sigma_eps=None, diag_error_structure=None,
       standardize_x="unitcube", standardize_y="zscore")
 ```
@@ -86,7 +86,8 @@ MOOGP(terms, q, Psi=None, *,
 | Argument | Default | Purpose |
 | --- | --- | --- |
 | `terms` | — | Basis for the trend `g(x)` ([section](#specifying-the-trend-with-terms)). |
-| `q` | — | Number of latent GPs (`q ≤ p`) ([section](#choosing-q)). |
+| `q` | `None` | Number of latent GPs (`q ≤ p`); defaults to full rank `p` when neither `q` nor `var_threshold` is given ([section](#choosing-q)). |
+| `var_threshold` | `None` | Pick `q` automatically to capture this fraction of output variance; mutually exclusive with `q` ([section](#choosing-q)). |
 | `orthogonal` | `True` | Orthogonalize the kernel against `g(x)`; `False` is a standard squared exponential kernel. |
 | `sigma_eps2` | `None` | Fixed per-output noise variances, shape `(p,)` ([section](#measurement-noise-and-diag_error_structure)).  |
 | `learn_sigma_eps` | auto | Learn the noise; defaults to `True` when `sigma_eps2` is not given. |
@@ -111,10 +112,16 @@ terms = [None, 1, 2, (1, 2)]   # g(x) = [1, x1, x2, x1 * x2]
 
 ### Choosing `q`
 
-`q` is the number of latent GPs and must satisfy `q ≤ p`. It acts as a rank: the
-latent basis is taken from the top `q` principal directions of `Y`, so inspecting
-the singular value spectrum of `Y` helps pick it. Start small and increase until
-predictive performance stops improving; `q = p` is full rank.
+There are two ways that the number of latent components `q` can be explicitly specified upon intializing a MOOGP instance:
+  1. `q=5`: Five latent components will be used. `q` must be less than or equal to the output dimension `p`
+  2. `var_threshold = 0.99`: Include q latent components such that 99% of the output variance are explained, using a singular value decomposition.
+
+ > **Note**: Only one of the options should be provided at a time.
+
+```python
+model_q   = MOOGP(terms=[None, 1, 2], q=5)
+model_var = MOOGP(terms=[None, 1, 2], var_threshold=0.99)
+```
 
 ### Measurement noise and `diag_error_structure`
 
