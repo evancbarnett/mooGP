@@ -1,6 +1,6 @@
 import numpy as np
-from src.moogp.datasets import generate_forrester_data
-from src.moogp.model import MOOGP, unpack_theta
+from moogp.datasets import generate_forrester_data
+from moogp.model import MOOGP, unpack_theta
 
 def test_learn_sigma_eps_fixed_psi():
 

@@ -1,7 +1,7 @@
 import numpy as np
 
-from src.moogp.model import init_phi
-from src.moogp.model import MOOGP
+from moogp.model import init_phi
+from moogp.model import MOOGP
 
 
 def _latent_theta(q: int, d: int, sigma2: float = 1.0, ell: float = 0.7) -> np.ndarray:

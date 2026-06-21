@@ -345,7 +345,7 @@ wheels = [
 [[package]]
 name = "moogp"
 version = "0.9.1"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "autograd" },
     { name = "numpy" },

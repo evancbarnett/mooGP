@@ -1,6 +1,6 @@
 import numpy as np
 
-from src.moogp.datasets import (
+from moogp.datasets import (
     tstd2theta,
     xstd2x,
     generate_borehole_data_nd,

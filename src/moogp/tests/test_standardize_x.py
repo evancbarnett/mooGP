@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from src.moogp.model import (
+from moogp.model import (
     MOOGP,
     _compute_x_center_scale,
     _normalize_standardize_x_mode,

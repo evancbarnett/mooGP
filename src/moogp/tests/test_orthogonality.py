@@ -1,8 +1,8 @@
 import numpy as np
 from scipy.integrate import quad
 
-from src.moogp.design import parse_terms_to_index_sets
-from src.moogp.kernels import (
+from moogp.design import parse_terms_to_index_sets
+from moogp.kernels import (
     M_gauss,
     L_gauss,
     IM_gauss,

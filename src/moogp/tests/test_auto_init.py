@@ -11,8 +11,8 @@ that omitting the arguments matches passing the default explicitly.
 import numpy as np
 import pytest
 
-from src.moogp.datasets import generate_forrester_data
-from src.moogp.model import MOOGP, unpack_theta
+from moogp.datasets import generate_forrester_data
+from moogp.model import MOOGP, unpack_theta
 
 
 def _forrester(n=40, seed=3):
