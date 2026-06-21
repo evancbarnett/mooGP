@@ -110,6 +110,8 @@ terms = [None, 1, 2, 3]        # g(x) = [1, x1, x2, x3]
 terms = [None, 1, 2, (1, 2)]   # g(x) = [1, x1, x2, x1 * x2]
 ```
 
+--- 
+
 ### Choosing `q`
 
 There are two ways that the number of latent components `q` can be explicitly specified upon intializing a MOOGP instance:
@@ -122,6 +124,8 @@ There are two ways that the number of latent components `q` can be explicitly sp
 model_q   = MOOGP(terms=[None, 1, 2], q=5)
 model_var = MOOGP(terms=[None, 1, 2], var_threshold=0.99)
 ```
+
+---
 
 ### Measurement noise and `diag_error_structure`
 
@@ -159,6 +163,8 @@ model = MOOGP(terms=[None, 1], q=4, diag_error_structure=[2, 4])
 model.fit({"X": x, "Y": Y})
 ```
 
+---
+
 ### Standardization
 
 By default the model rescales data internally:
@@ -169,6 +175,8 @@ By default the model rescales data internally:
 Set either to `False` if your data is already on the right scale. Predictions are
 always returned on the original output scale.
 
+---
+
 ### Optimizer control and tolerance
 
 The default optimization parameters for LBFGS-B are shown below and can be tuned via `optimizer_opts`:
@@ -178,6 +186,8 @@ model.fit(data, optimizer_opts={"maxiter": 500, "ftol": 1e-9, "gtol": 1e-6})
 ```
 
 Start with a relatively low value for `maxiter` and increase if better performance is needed.
+
+---
 
 ### Kernel and mixing-matrix options
 
