@@ -1,4 +1,4 @@
-# MOOGP — Multi-Output Orthogonal Gaussian Process
+# MOOGP - Multi-Output Orthogonal Gaussian Process
 
 `moogp` emulates vector-valued (multi-output) functions with a **multi-output
 orthogonal Gaussian process**. It models the `p` outputs as a linear combination
