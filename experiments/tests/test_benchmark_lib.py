@@ -16,7 +16,6 @@ from ..benchmark_lib import (
     build_dataset_bundle,
     compute_metrics,
     fit_method_local,
-    make_latent_theta0_and_bounds,
     method_python_executable,
     normalize_covariance,
     run_benchmarks,
@@ -37,26 +36,6 @@ def test_build_borehole_bundle_reuses_output_locations_and_shapes():
     assert not np.allclose(bundle.train_data["Y"], bundle.extra["Y_train_clean"])
     assert np.allclose(bundle.train_data["Y"], bundle_same.train_data["Y"])
     assert np.allclose(bundle.test_Y_true, bundle_same.test_Y_true)
-
-
-def test_make_latent_theta0_and_bounds_matches_forrester_defaults():
-    theta0, bounds = make_latent_theta0_and_bounds(q=2, d=3, seed_model=999)
-
-    expected = np.array(
-        [
-            np.log(1.0),
-            np.log(0.5),
-            np.log(0.5),
-            np.log(0.5),
-            np.log(1.0),
-            np.log(0.5),
-            np.log(0.5),
-            np.log(0.5),
-        ]
-    )
-
-    assert np.allclose(theta0, expected)
-    assert len(bounds) == theta0.size
 
 
 def test_run_benchmarks_parallel_path_writes_rows_for_stub_methods(tmp_path: Path):
@@ -565,79 +544,11 @@ def test_compute_metrics_accepts_diag_and_full_covariance_shapes():
     assert np.isclose(metrics["dss_full"], metrics_ppn["dss_full"])
 
 
-def test_fit_method_local_moogp_uses_standardized_y_for_sigma_init(tmp_path: Path, monkeypatch):
-    config = ExperimentConfig(
-        functions=("borehole",),
-        methods=("MOOGP",),
-        sample_sizes=(8,),
-        output_dims=(4,),
-        reps=1,
-        n_test=5,
-        q=3,
-        maxiter=5,
-        jitter=1e-6,
-        noise_var_frac=1e-2,
-        use_fast=True,
-        jobs=1,
-        base_seed=123,
-        results_dir=tmp_path,
-    )
-    bundle = build_dataset_bundle(function="borehole", n=8, p=4, n_test=5, seed_data=123)
-
-    captured: dict[str, np.ndarray | str] = {}
-    original_append = benchmark_lib.append_sigma_eps_theta0_and_bounds
-
-    def capture_append(theta0, bounds, y_train, diag_error_structure=None):
-        captured["y_train_arg"] = np.asarray(y_train, dtype=float).copy()
-        return original_append(theta0, bounds, y_train, diag_error_structure=diag_error_structure)
-
-    def fake_fit(self, data, theta0, bounds=None, optimizer_opts=None):
-        self.opt_result = SimpleNamespace(success=True, message="")
-        self.fitted = True
-        return self
-
-    def fail_prepare(_self, _data):
-        raise AssertionError("_fit_moogp_like should not call _prepare_data before fit().")
-
-    monkeypatch.setattr(benchmark_lib, "append_sigma_eps_theta0_and_bounds", capture_append)
-    monkeypatch.setattr("moogp.model.MOOGP._prepare_data", fail_prepare)
-    monkeypatch.setattr("moogp.model.MOOGP.fit", fake_fit)
-
-    predictor = fit_method_local(method="MOOGP", bundle=bundle, seed_model=456, config=config)
-
-    y_work = np.asarray(captured["y_train_arg"], dtype=float)
-    assert predictor.status == "ok"
-    assert np.allclose(np.mean(y_work, axis=0), 0.0, atol=1e-12)
-    assert np.allclose(np.std(y_work, axis=0, ddof=1), 1.0, atol=1e-12)
-
-
-def test_fit_method_local_mogp_uses_standardized_y_for_sigma_init(tmp_path: Path, monkeypatch):
-    config = ExperimentConfig(
-        functions=("borehole",),
-        methods=("MOGP",),
-        sample_sizes=(8,),
-        output_dims=(4,),
-        reps=1,
-        n_test=5,
-        q=3,
-        maxiter=5,
-        jitter=1e-6,
-        noise_var_frac=1e-2,
-        use_fast=True,
-        jobs=1,
-        base_seed=123,
-        results_dir=tmp_path,
-    )
-    bundle = build_dataset_bundle(function="borehole", n=8, p=4, n_test=5, seed_data=123)
-
-    captured: dict[str, np.ndarray | str] = {}
-    original_append = benchmark_lib.append_sigma_eps_theta0_and_bounds
-
-    def capture_append(theta0, bounds, y_train, diag_error_structure=None):
-        captured["y_train_arg"] = np.asarray(y_train, dtype=float).copy()
-        return original_append(theta0, bounds, y_train, diag_error_structure=diag_error_structure)
+def _capture_moogp_like_fit_call(method: str, bundle, config, monkeypatch):
+    """Run ``_fit_moogp_like`` with MOOGP.__init__/fit stubbed; return (model, fit_kwargs)."""
 
     captured_models: list[object] = []
+    captured_fit: dict[str, object] = {}
     from moogp.model import MOOGP as _RealMOOGP
     orig_init = _RealMOOGP.__init__
 
@@ -645,29 +556,70 @@ def test_fit_method_local_mogp_uses_standardized_y_for_sigma_init(tmp_path: Path
         orig_init(self, *init_args, **init_kwargs)
         captured_models.append(self)
 
-    def fake_fit(self, data, theta0, bounds=None, optimizer_opts=None):
+    def fake_fit(self, data, theta0=None, bounds=None, optimizer_opts=None):
+        captured_fit["theta0"] = theta0
+        captured_fit["bounds"] = bounds
         self.opt_result = SimpleNamespace(success=True, message="")
         self.fitted = True
         return self
 
-    def fail_prepare(_self, _data):
-        raise AssertionError("_fit_moogp_like should not call _prepare_data before fit().")
-
-    monkeypatch.setattr(benchmark_lib, "append_sigma_eps_theta0_and_bounds", capture_append)
     monkeypatch.setattr("moogp.model.MOOGP.__init__", capture_init)
-    monkeypatch.setattr("moogp.model.MOOGP._prepare_data", fail_prepare)
     monkeypatch.setattr("moogp.model.MOOGP.fit", fake_fit)
 
-    predictor = fit_method_local(method="MOGP", bundle=bundle, seed_model=456, config=config)
+    predictor = fit_method_local(method=method, bundle=bundle, seed_model=456, config=config)
 
-    y_work = np.asarray(captured["y_train_arg"], dtype=float)
     assert predictor.status == "ok"
     assert len(captured_models) == 1
-    model = captured_models[0]
+    return captured_models[0], captured_fit
+
+
+def _moogp_smoke_config(method: str, tmp_path: Path) -> ExperimentConfig:
+    return ExperimentConfig(
+        functions=("borehole",),
+        methods=(method,),
+        sample_sizes=(8,),
+        output_dims=(4,),
+        reps=1,
+        n_test=5,
+        q=3,
+        maxiter=5,
+        jitter=1e-6,
+        noise_var_frac=1e-2,
+        use_fast=True,
+        jobs=1,
+        base_seed=123,
+        results_dir=tmp_path,
+    )
+
+
+def test_fit_method_local_moogp_delegates_data_aware_init_to_model(tmp_path: Path, monkeypatch):
+    # The adapter no longer hand-builds theta0/bounds: it omits both so MOOGP.fit
+    # derives the data-aware initialization internally from the standardized
+    # working-scale outputs. standardize_y="zscore" guarantees the in-model
+    # sigma_eps init sees zero-mean / unit-variance Y (the scale guarantee the
+    # deleted append_sigma_eps capture test used to protect; now exercised
+    # end-to-end in src/moogp/tests/test_auto_init.py).
+    config = _moogp_smoke_config("MOOGP", tmp_path)
+    bundle = build_dataset_bundle(function="borehole", n=8, p=4, n_test=5, seed_data=123)
+
+    model, fit_kwargs = _capture_moogp_like_fit_call("MOOGP", bundle, config, monkeypatch)
+
+    assert fit_kwargs["theta0"] is None
+    assert fit_kwargs["bounds"] is None
+    assert model.orthogonal is True
+    assert model.standardize_y == "zscore"
+
+
+def test_fit_method_local_mogp_delegates_data_aware_init_to_model(tmp_path: Path, monkeypatch):
+    config = _moogp_smoke_config("MOGP", tmp_path)
+    bundle = build_dataset_bundle(function="borehole", n=8, p=4, n_test=5, seed_data=123)
+
+    model, fit_kwargs = _capture_moogp_like_fit_call("MOGP", bundle, config, monkeypatch)
+
+    assert fit_kwargs["theta0"] is None
+    assert fit_kwargs["bounds"] is None
     assert model.orthogonal is False
     assert model.standardize_y == "zscore"
-    assert np.allclose(np.mean(y_work, axis=0), 0.0, atol=1e-12)
-    assert np.allclose(np.std(y_work, axis=0, ddof=1), 1.0, atol=1e-12)
 
 
 def test_fit_method_local_moogp_extracts_optimizer_diagnostics(tmp_path: Path, monkeypatch):
@@ -689,7 +641,7 @@ def test_fit_method_local_moogp_extracts_optimizer_diagnostics(tmp_path: Path, m
     )
     bundle = build_dataset_bundle(function="borehole", n=8, p=4, n_test=5, seed_data=123)
 
-    def fake_fit(self, data, theta0, bounds=None, optimizer_opts=None):
+    def fake_fit(self, data, theta0=None, bounds=None, optimizer_opts=None):
         self.opt_result = SimpleNamespace(success=True, message="", nit=7, njev=8, nfev=9)
         self.fitted = True
         return self

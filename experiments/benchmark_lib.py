@@ -212,7 +212,7 @@ def extract_optimizer_diagnostics(opt_result: Any) -> dict[str, int | None]:
     if isinstance(opt_result, dict):
         getter = opt_result.get
     else:
-        getter = lambda name: getattr(opt_result, name, None)
+        def getter(name): return getattr(opt_result, name, None)
 
     return {
         name: _coerce_optional_int(getter(name))
@@ -532,130 +532,6 @@ def _build_vah_bundle(
     )
 
 
-def make_latent_theta0_and_bounds(q: int, d: int, seed_model: int) -> tuple[np.ndarray, list[tuple[float, float]]]:
-    """Build the fixed latent initialization used in ``fit_moogp_forrester``."""
-
-    theta0: list[float] = []
-    bounds: list[tuple[float, float]] = []
-
-    for _ in range(q):
-        theta0.append(float(np.log(1.0)))
-        theta0.extend([float(np.log(0.5))] * d)
-        bounds.append((float(np.log(1e-3)), float(np.log(1e6))))
-        bounds.extend([(float(np.log(0.05)), float(np.log(100.0)))] * d)
-
-    return np.asarray(theta0, dtype=float), bounds
-
-
-def append_sigma_eps_theta0_and_bounds(
-    theta0: np.ndarray,
-    bounds: list[tuple[float, float]],
-    y_train: np.ndarray,
-    diag_error_structure: list[int] | None = None,
-) -> tuple[np.ndarray, list[tuple[float, float]]]:
-    """Append the sigma-eps block exactly as in ``fit_moogp_forrester``.
-
-    With a non-trivial ``diag_error_structure``, MOOGP carries one log-variance
-    per group rather than per output, so we collapse the per-output sample
-    variances to per-group means before initializing.
-    """
-
-    y_var = np.maximum(1e-12, np.var(np.asarray(y_train, dtype=float), axis=0, ddof=1))
-    if diag_error_structure is not None:
-        sizes = np.asarray(diag_error_structure, dtype=int)
-        if int(sizes.sum()) != y_var.size:
-            raise ValueError(
-                f"diag_error_structure widths sum to {int(sizes.sum())} but "
-                f"y has {y_var.size} columns."
-            )
-        breakpoints = np.concatenate([[0], np.cumsum(sizes)[:-1]])
-        y_var = np.add.reduceat(y_var, breakpoints) / sizes
-    sigma_eps2_init = np.log(1e-2 * y_var)
-    theta0_out = np.concatenate([theta0, sigma_eps2_init])
-
-    lb = np.maximum(1e-12, 1e-6 * y_var)
-    ub = np.maximum(lb * 10.0, 0.5 * y_var)
-    log_bounds = [(float(np.log(lbi)), float(np.log(ubi))) for lbi, ubi in zip(lb, ub)]
-    return theta0_out, bounds + log_bounds
-
-
-def make_data_aware_theta0_and_bounds(
-    q: int,
-    d: int,
-    seed_model: int,
-    X_work: np.ndarray,
-    Y_work: np.ndarray,
-    diag_error_structure: list[int] | None = None,
-) -> tuple[np.ndarray, list[tuple[float, float]]]:
-    """Data-aware MOOGP initialization (bounds identical to the constant init).
-
-    The constant init (``make_latent_theta0_and_bounds`` +
-    ``append_sigma_eps_theta0_and_bounds``) starts every latent at
-    ``sigma^2 = 1``, every length-scale at ``0.5``, and the noise at
-    ``1e-2 * y_var``. On VAH that places the optimizer several orders of
-    magnitude (in log-space) from the NLL mode, so L-BFGS-B spends hundreds
-    of iterations just walking the scale parameters into range.
-
-    This builds the same box bounds but seeds ``theta0`` from the working-
-    scale data (mirroring LCGP's ``init_params``):
-
-    * ``sigma^2_k = s_k^2 / n`` where ``s_k`` are the singular values of
-      ``Y_work`` (undoes the ``Phi`` SVD normalization in the fast path).
-    * ``ell_{k,j} = exp(0.5*log(d) + log(std(X_work[:, j])))`` — the
-      ``sqrt(d) * std(X)`` heuristic, shared across latents.
-    * ``sigma^2_eps`` = per-group variance of the rank-``q`` SVD
-      reconstruction residual of ``Y_work`` (a data-implied noise floor).
-
-    All seeds are clipped into the box so the optimizer starts feasible.
-    Empirically (``notebooks/vah_moogp_diagnostic.ipynb`` §15) this reaches
-    the *same* NLL / RMSE / coverage as the constant init in ~32 % fewer
-    L-BFGS-B iterations on VAH fold 1.
-    """
-
-    # Reuse the constant path purely to get the (unchanged) box bounds.
-    _, bounds = make_latent_theta0_and_bounds(q=q, d=d, seed_model=seed_model)
-    _, bounds = append_sigma_eps_theta0_and_bounds(
-        theta0=np.zeros(q * (d + 1), dtype=float),
-        bounds=bounds,
-        y_train=Y_work,
-        diag_error_structure=diag_error_structure,
-    )
-
-    X_work = np.asarray(X_work, dtype=float)
-    Y_work = np.asarray(Y_work, dtype=float)
-    n = Y_work.shape[0]
-
-    U, svals, Vt = np.linalg.svd(Y_work, full_matrices=False)
-    s_q = np.maximum(svals[:q], 1e-12)
-    s2_k = (s_q ** 2) / float(n)  # = 1 / d_vals in moogp.model.init_phi
-
-    std_x = np.std(X_work, axis=0)
-    std_x = np.where(std_x > 1e-12, std_x, 1.0)
-    log_ell = 0.5 * np.log(d) + np.log(std_x)  # shared across latents
-
-    theta0: list[float] = []
-    for k in range(q):
-        theta0.append(float(np.log(max(s2_k[k], 1e-8))))
-        theta0.extend(float(v) for v in log_ell)
-
-    # Rank-q SVD reconstruction residual -> per-group noise-floor init.
-    Y_hat = U[:, :q] @ np.diag(svals[:q]) @ Vt[:q, :]
-    resid_var = np.maximum(np.var(Y_work - Y_hat, axis=0, ddof=1), 1e-12)
-    if diag_error_structure is not None:
-        sizes = np.asarray(diag_error_structure, dtype=int)
-        bp = np.concatenate([[0], np.cumsum(sizes)[:-1]])
-        resid_var = np.add.reduceat(resid_var, bp) / sizes
-    eps_init = np.log(resid_var)
-
-    theta0_arr = np.concatenate([np.asarray(theta0, dtype=float), eps_init])
-
-    # Clip every seed strictly inside its box so L-BFGS-B starts feasible.
-    lo = np.array([b[0] for b in bounds], dtype=float)
-    hi = np.array([b[1] for b in bounds], dtype=float)
-    theta0_arr = np.minimum(np.maximum(theta0_arr, lo), hi)
-    return theta0_arr, bounds
-
-
 def fit_method_local(method: str, bundle: DatasetBundle, seed_model: int, config: ExperimentConfig) -> FittedPredictor:
     """Fit one benchmark method and return a standardized predictor."""
 
@@ -765,7 +641,7 @@ def _fit_moogp_like(
     *,
     orthogonal: bool,
 ) -> FittedPredictor:
-    from moogp.model import MOOGP, compute_working_x, compute_working_y
+    from moogp.model import MOOGP
 
     # Exclude import/setup overhead, but include all model work required before predict.
     train_t0 = time.perf_counter()
@@ -799,30 +675,14 @@ def _fit_moogp_like(
         x_margin=x_margin,
         diag_error_structure=diag_error_structure,
     )
-    fit_data = {"X_scaled": bundle.train_data["X_scaled"], "y": y_train}
-    # Data-aware initialization: same box bounds as the legacy constant init
-    # but theta0 seeded from the working-scale SVD / input spread. Reaches the
-    # same NLL/RMSE/coverage in ~32% fewer L-BFGS-B iterations on VAH
-    # (see notebooks/vah_moogp_diagnostic.ipynb §15).
-    X_work, _, _ = compute_working_x(
-        bundle.train_data["X_scaled"], model.standardize_x, margin=x_margin,
-    )
-    y_work, _, _ = compute_working_y(y_train, model.standardize_y)
-    theta0, bounds = make_data_aware_theta0_and_bounds(
-        q=q_eff,
-        d=d,
-        seed_model=seed_model,
-        X_work=X_work,
-        Y_work=y_work,
-        diag_error_structure=diag_error_structure,
-    )
+    # theta0 / bounds are omitted: MOOGP.fit builds a data-aware initialization
+    # internally from the standardized working-scale data (the SVD/input-spread
+    # seeds and box bounds the external make_data_aware_theta0_and_bounds helper
+    # used to supply). This reaches the same NLL/RMSE/coverage in ~32% fewer
+    # L-BFGS-B iterations on VAH (see notebooks/vah_moogp_diagnostic.ipynb §15).
     model.fit(
-        data=fit_data,
-        theta0=theta0,
-        bounds=bounds,
-        optimizer_opts={"maxiter": config.maxiter,
-                        # "ftol": 1e10*np.finfo(float).eps
-                        },
+        data={"X_scaled": bundle.train_data["X_scaled"], "y": y_train},
+        optimizer_opts={"maxiter": config.maxiter},
     )
     train_time_sec = time.perf_counter() - train_t0
 

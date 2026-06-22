@@ -1,0 +1,34 @@
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  build:
+    name: python-compatability
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version:
+          - "3.11"
+          - "3.12"
+          - "3.13"
+          - "3.14"
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv and set the Python version
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.15"
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install the project
+        run: uv sync --locked --all-extras --dev
+
+      - name: Run linter
+        run: uv run ruff check
+
+      - name: Run tests
+        # For example, using `pytest`
+        run: uv run pytest ./src/moogp/tests

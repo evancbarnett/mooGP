@@ -1,10 +1,57 @@
-.venv/
-.vscode/
-**/__pycache__/
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-AGENTS.md
-.DS_Store
+# Environments
+.venv/
 .venv-oilmm/
 .venv-puq/
-docs/
+.env
+.env.*
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# LaTeX generated files
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz
+*.bbl
+*.blg
+*.fls
+*.fdb_latexmk
+
+# Experiment outputs
+results/
+results-*/
+results_*/
+*_results/
+
+# OGP files
+ogp/
+
+# Scratch diagnostics
+experiments/_diag_*.json
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+
+# MOOGP research/experimental files
+src/moogp/figs/
+/moogp/
+experiments/thread_diagnostics.py
+notebooks/
+examples/*.py
