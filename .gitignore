@@ -54,3 +54,4 @@ src/moogp/figs/
 /moogp/
 experiments/thread_diagnostics.py
 notebooks/
+examples/*.py
