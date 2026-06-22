@@ -1,5 +1,7 @@
 # MOOGP - Multi-Output Orthogonal Gaussian Process
 
+<img src="./moogp_logo_core.svg" style="max-width: 500px;" alt="mooGP">
+
 `moogp` emulates vector-valued (multi-output) functions with a **multi-output
 orthogonal Gaussian process**. It models the `p` outputs as a linear combination
 of `q` shared latent GPs, plus a regression trend `g(x)` that the latent
