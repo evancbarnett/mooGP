@@ -1,7 +1,7 @@
 site_name: mooGP documentation
 theme:
   name: mkdocs
-  logo: https://github.com/evancbarnett/mooGP/blob/main/logo/moogp_logo_core.svg
+  logo: https://raw.githubusercontent.com/evancbarnett/moogp/mkdocs/logo/moogp_logo_core.svg
 repo_url: https://github.com/evancbarnett/moogp/
 docs_dir: examples
 nav:
@@ -14,3 +14,9 @@ plugins:
       execute: true
   - include-markdown
   - search
+markdown_extensions:
+  - pymdownx.arithmatex:
+      generic: true
+extra_javascript:
+  - javascripts/mathjax.js
+  - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
