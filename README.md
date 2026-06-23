@@ -1,5 +1,10 @@
 # MOOGP - Multi-Output Orthogonal Gaussian Process
 
+![Python Version](https://img.shields.io/python/required-version-toml?tomlFilePath=https%3A%2F%2Fgithub.com%2Fevancbarnett%2FmooGP%2Fraw%2Frefs%2Fheads%2Fmain%2Fpyproject.toml)
+![Build Status](https://img.shields.io/github/actions/workflow/status/evancbarnett/moogp/python-package.yml)
+[![Coverage Status](https://coveralls.io/repos/github/evancbarnett/mooGP/badge.svg?branch=mkdocs)](https://coveralls.io/github/evancbarnett/mooGP)
+
+
 <img src="https://raw.githubusercontent.com/evancbarnett/moogp/mkdocs/logo/moogp_logo_core.svg" style="max-width: 450px;" alt="mooGP">
 
 `moogp` emulates vector-valued (multi-output) functions with a **multi-output
