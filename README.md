@@ -5,7 +5,7 @@
 [![Coverage Status](https://coveralls.io/repos/github/evancbarnett/mooGP/badge.svg?branch=mkdocs)](https://coveralls.io/github/evancbarnett/mooGP)
 
 
-<img src="https://raw.githubusercontent.com/evancbarnett/moogp/mkdocs/logo/moogp_logo_core.svg" style="max-width: 450px;" alt="mooGP">
+<img src="https://raw.githubusercontent.com/evancbarnett/moogp/main/logo/moogp_logo_core.svg" style="max-width: 450px;" alt="mooGP">
 
 `moogp` emulates vector-valued (multi-output) functions with a **multi-output
 orthogonal Gaussian process**. It models the `p` outputs as a linear combination
