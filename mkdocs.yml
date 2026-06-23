@@ -10,6 +10,7 @@ nav:
     - Trend: 01_trend_specification.ipynb
   - README: index.md
 plugins:
-  - mkdocs-jupyter
+  - mkdocs-jupyter:
+      execute: true
   - include-markdown
   - search
