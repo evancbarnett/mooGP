@@ -21,6 +21,10 @@ build/
 # Jupyter
 .ipynb_checkpoints/
 
+# MkDocs
+site/
+.cache/
+
 # LaTeX generated files
 *.aux
 *.log

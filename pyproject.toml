@@ -31,7 +31,11 @@ classifiers = [
 
 [dependency-groups]
 dev = [
+    "coveralls>=4.1.0",
     "matplotlib>=3.10.9",
+    "mkdocs>=1.6.1",
+    "mkdocs-include-markdown-plugin>=7.3.0",
+    "mkdocs-jupyter>=0.26.3",
     "pytest-cov>=7.1.0",
     "ruff>=0.15.16",
     "scipy-stubs>=1.17.1.5",

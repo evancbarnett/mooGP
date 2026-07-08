@@ -31,4 +31,9 @@ jobs:
 
       - name: Run tests
         # For example, using `pytest`
-        run: uv run pytest ./src/moogp/tests
+        run: uv run coverage run -m pytest ./src/moogp/tests
+
+      - name: Coveralls
+        run: uv run coveralls --service=github-actions
+        env:
+          COVERALLS_REPO_TOKEN: ${{ secrets.COVERALLS_REPO_TOKEN }}
