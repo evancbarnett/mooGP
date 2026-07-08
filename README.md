@@ -90,18 +90,19 @@ MOOGP(terms, q=None, Psi=None, *,
       standardize_x="unitcube", standardize_y="zscore")
 ```
 
-| Argument | Default | Purpose |
-| --- | --- | --- |
-| `terms` | — | Basis for the trend `g(x)` ([section](#specifying-the-trend-with-terms)). |
-| `q` | `None` | Number of latent GPs (`q ≤ p`); defaults to full rank `p` when neither `q` nor `var_threshold` is given ([section](#choosing-q)). |
-| `var_threshold` | `None` | Pick `q` automatically to capture this fraction of output variance; mutually exclusive with `q` ([section](#choosing-q)). |
-| `orthogonal` | `True` | Orthogonalize the kernel against `g(x)`; `False` is a standard squared exponential kernel. |
-| `sigma_eps2` | `None` | Fixed per-output noise variances, shape `(p,)` ([section](#measurement-noise-and-diag_error_structure)).  |
-| `learn_sigma_eps` | auto | Learn the noise; defaults to `True` when `sigma_eps2` is not given. |
-| `diag_error_structure` | `None` | Group outputs that share one noise variance ([section](#measurement-noise-and-diag_error_structure)). |
-| `standardize_x` | `"unitcube"` | Map inputs to `[-1, 1]` internally ([section](#standardization)). |
-| `standardize_y` | `"zscore"` | Center and scale outputs internally. |
-| `learn_Psi` | `False` | Learn the mixing matrix instead of deriving it from the data ([section](#kernel-and-mixing-matrix-options)). |
+| Argument               | Default | Purpose                                                                                                                                                                                |
+|------------------------| --- |----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `terms`                | — | Basis for the trend `g(x)` ([section](#specifying-the-trend-with-terms)).                                                                                                              |
+| `q`                    | `None` | Number of latent GPs (`q ≤ p`); defaults to full rank `p` when neither `q` nor `var_threshold` is given ([section](#choosing-q)).                                                      |
+| `Psi`                  | `None` | (p, q) array or None; Initial / fixed mixing matrix. If learn_Psi=False, this must be provided. If learn_Psi=True, it's used for shape ([section](#kernel-and-mixing-matrix-options)). |
+| `var_threshold`        | `None` | Pick `q` automatically to capture this fraction of output variance; mutually exclusive with `q` ([section](#choosing-q)).                                                              |
+| `orthogonal`           | `True` | Orthogonalize the kernel against `g(x)`; `False` is a standard squared exponential kernel.                                                                                             |
+| `sigma_eps2`           | `None` | Fixed per-output noise variances, shape `(p,)` ([section](#measurement-noise-and-diag_error_structure)).                                                                               |
+| `learn_sigma_eps`      | auto | Learn the noise; defaults to `True` when `sigma_eps2` is not given.                                                                                                                    |
+| `diag_error_structure` | `None` | Group outputs that share one noise variance ([section](#measurement-noise-and-diag_error_structure)).                                                                                  |
+| `standardize_x`        | `"unitcube"` | Map inputs to `[-1, 1]` internally ([section](#standardization)).                                                                                                                      |
+| `standardize_y`        | `"zscore"` | Center and scale outputs internally.                                                                                                                                                   |
+| `learn_Psi`            | `False` | Learn the mixing matrix instead of deriving it from the data ([section](#kernel-and-mixing-matrix-options)).                                                                           |
 
 
 ## Advanced Usage
