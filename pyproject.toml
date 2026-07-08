@@ -8,7 +8,7 @@ authors = [
   {name = "Evan C. Barnett", email = "evanbarnett2027@u.northwestern.edu"},
   {name = "Moses Y.-H. Chan", email = "moses.chan@northwestern.edu"},
 ]
-version = "0.9.2"
+version = "1.0.0"
 description = "Multioutput orthogonal Gaussian process"
 readme = "README.md"
 requires-python = ">=3.11"
