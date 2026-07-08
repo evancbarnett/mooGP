@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata from this file."
+title: "mooGP: Multi-Output Orthogonal Gaussian Process"
+type: software
+authors:
+  - family-names: Barnett
+    given-names: Evan C.
+    email: evanbarnett2027@u.northwestern.edu
+    affiliation: Northwestern University
+  - family-names: Chan
+    given-names: Moses Y.-H.
+    email: moses.chan@northwestern.edu
+    affiliation: Northwestern University
+version: 1.0.0
+repository-code: "https://github.com/evancbarnett/mooGP"
+url: "https://github.com/evancbarnett/mooGP"
+abstract: >-
+  Package for multi-output emulation for stochastic simulators.
+  moogp emulates vector-valued (multi-output) functions with a
+  multi-output orthogonal Gaussian process, modeling the outputs
+  as a linear combination of shared latent GPs plus a regression
+  trend that the latent kernels are orthogonalized against.
+keywords:
+  - emulator
+  - gaussian process
+  - calibration
+  - statistics
+  - surrogate
+license: GPL-3.0-only
