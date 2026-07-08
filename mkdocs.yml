@@ -8,6 +8,11 @@ nav:
   - Getting Started: 00_getting_started.ipynb
   - Example Usage:
     - Trend: 01_trend_specification.ipynb
+    - Choosing q: 02_choosing_q.ipynb
+    - Measurement noise: 03_measurement_noise.ipynb
+    - Standardization: 04_standardization.ipynb
+    - Optimizer control: 05_optimizer_control.ipynb
+    - Kernel & mixing matrix: 06_kernel_and_mixing_matrix.ipynb
   - README: index.md
 plugins:
   - mkdocs-jupyter:
