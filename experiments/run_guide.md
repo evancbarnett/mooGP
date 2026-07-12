@@ -249,12 +249,42 @@ Useful additions:
 ### 2b. Run on AWS
 
 The same `run_one.sh` works under any of the typical AWS execution patterns.
-A minimal recipe with a single EC2 instance and GNU parallel:
+
+**Important: detach the sweep from your SSH session first.** A full sweep
+runs for hours to days. If you launch `parallel` directly on the SSH login
+shell and the connection drops (laptop sleeps, Wi-Fi blip, you close the
+terminal), every worker dies with SIGHUP and you lose the run. Always wrap
+the sweep in a persistent terminal multiplexer — `tmux` is preinstalled on
+Amazon Linux and one `apt-get` away on Ubuntu. The pattern:
+
+```bash
+# On the EC2 instance, before launching the sweep:
+sudo apt-get install -y tmux        # Ubuntu; skip on Amazon Linux (preinstalled)
+tmux new -s moogp                   # start a named session (use any name)
+
+# ... your venv setup + the parallel command go inside this tmux session ...
+
+# Detach without killing the session:   Ctrl-b  then  d
+# Reattach later (after re-SSHing in):
+tmux attach -t moogp                # or `tmux a` if there's only one session
+
+# List sessions:                    tmux ls
+# Kill a finished session:          tmux kill-session -t moogp
+```
+
+`nohup parallel ...` and `setsid` are alternatives, but tmux is strictly
+better here because (a) you can re-attach and watch progress / read GNU
+parallel's live stderr, (b) you can split the tmux window to monitor
+`top`/`htop` and the per-job CSV directory in parallel, and (c) failed
+restarts can be done in-session without re-uploading scripts.
+
+A minimal recipe with a single EC2 instance and GNU parallel, run inside
+the `tmux` session:
 
 ```bash
 # On a fresh EC2 instance (Ubuntu / Amazon Linux). Pick an instance type sized
 # for the largest cell in the sweep (e.g. c7i.4xlarge for a 16-core sweep).
-sudo apt-get update && sudo apt-get install -y git build-essential parallel python3.11 python3.11-venv
+sudo apt-get update && sudo apt-get install -y git build-essential parallel tmux python3.11 python3.11-venv
 
 # Bring the repo and bench environments up. Each method that needs its own
 # interpreter (OILMM, PUQ) gets its own venv at the paths configured in
@@ -283,8 +313,9 @@ python -m venv .venv-puq && .venv-puq/bin/pip install \
   --results-dir results \
   --emit-jobs results/jobs.txt
 
-# Run the grid. Keep JOBS * THREADS at or below $(nproc); --joblog gives a
-# resumable log. On c7i.8xlarge, start with 8 * 4 = 32.
+# Run the grid INSIDE tmux (see the tmux callout above) so an SSH drop does
+# not kill the sweep. Keep JOBS * THREADS at or below $(nproc); --joblog
+# gives a resumable log. On c7i.8xlarge, start with 8 * 4 = 32.
 JOBS=8
 THREADS=4
 MOOGP_CONFIG="$PWD/results/config.json" \
@@ -293,6 +324,7 @@ MOOGP_SKIP_EXISTING=1 \
 MOOGP_THREADS="$THREADS" \
 parallel -j "$JOBS" --colsep ' ' --joblog results/jobs.log \
   ./experiments/run_one.sh {1} {2} {3} {4} {5} {6} :::: results/jobs.txt
+# After this kicks off:  Ctrl-b d  to detach, then `tmux a` to peek back in.
 
 # Merge and copy the artefact off the instance.
 .venv/bin/python -m experiments.merge_results \
@@ -336,7 +368,7 @@ without changes.
 ## VAH heavy-ion dataset (`--functions vah_nuclear`)
 
 The `vah_nuclear` function runs k-fold cross-validation on the VAH simulator
-data shipped at `moogp/nuclear_data/`:
+data shipped at `examples/nuclear_data/`:
 
 | File                | Shape       | Notes |
 | ------------------- | ----------- | ----- |
@@ -469,3 +501,297 @@ itself.
  - The `seed_data` column on VAH rows is the deterministic KFold seed
    (a function of `base_seed` and `n_folds`), not a per-cell seed; this is
    what makes the fold partition reproducible across reruns.
+
+---
+
+## Timing methodology — controlled wall-clock measurements
+
+The parallel mode above (`JOBS=8 THREADS=4`) is tuned for **throughput** — get
+the whole sweep done as fast as possible. Wall-clock recorded from a throughput
+run is **not** a controlled timing measurement, because effective per-job
+parallelism varies over the sweep as cells of different sizes complete.
+
+In practice we have observed up to a **3× spread** in `fit_time_seconds` within
+a single (function, method, n, p) cell on `JOBS=8 THREADS=4` runs (e.g. LCGP
+n=2500 p=5 runtimes ranging from ~24k to ~75k seconds across 10 reps), with
+zero job failures and zero OOM kills. The variance comes entirely from the
+fluctuating system state: SMT-thread sharing when all 8 workers are busy
+vs. full physical cores when smaller jobs finish and leave slots empty,
+plus shared L3 / memory-bandwidth contention.
+
+### Goal
+
+Produce per-method wall-clock numbers that:
+
+1. **Compare fairly across methods** — every method sees the same per-fit CPU
+   budget, so any timing difference is attributable to the method, not to who
+   got more BLAS threads at the time.
+2. **Reproduce within ~10%** rep-to-rep — so median over 5 reps is a stable
+   summary statistic.
+3. **Run on the same hardware as the accuracy sweep** — so accuracy and timing
+   numbers can be cited from the same experimental setup with no
+   "different-machine" footnote.
+
+The throughput sweep is kept for accuracy metrics (RMSE, coverage, DSS,
+log-score); the timing sweep below produces wall-clock only.
+
+### Setup overview ("Option D")
+
+Same instance as the accuracy sweep (`c7i.8xlarge`, 16 physical Sapphire
+Rapids cores × 2 SMT = 32 vCPUs, 64 GiB). Run **4 concurrent fits**, each
+pinned via `taskset` to **4 dedicated physical cores**. SMT siblings (CPUs
+16–31) are left idle so no fit ever shares a physical core with another fit.
+The per-fit thread budget (`THREADS=4`) matches the accuracy sweep.
+
+| Resource | Value | Why |
+| -------- | ----- | --- |
+| `JOBS` | 4 | One fit per non-overlapping 4-core block (cores 0–3, 4–7, 8–11, 12–15) |
+| `THREADS` | 4 | Same per-fit budget as the accuracy sweep → directly comparable |
+| Cores 16–31 | unused | SMT siblings; leaving idle eliminates intra-job hardware-thread sharing |
+| `taskset -c {%}*4 …` | pinning per slot | Each GNU parallel slot is locked to its 4 physical cores; kernel cannot migrate |
+
+This gives ~4× throughput vs serial (`JOBS=1`) at the same dollar cost, with
+~97% of the timing purity of running multiple isolated smaller instances. The
+remaining ~3% is L3-cache and memory-bandwidth contention between the 4
+concurrent fits, which for n=2500 GP workloads is below the rep-to-rep
+optimizer noise floor.
+
+### Pre-flight: verify CPU topology
+
+`taskset` operates on **OS CPU IDs**, not physical-core IDs. Before launching,
+confirm that CPU IDs 0..15 map to distinct physical cores (i.e. SMT siblings
+are CPU IDs 16..31), which is the standard layout on `c7i`:
+
+```bash
+lscpu --extended=CPU,CORE,SOCKET | head -40
+```
+
+Expected layout for `c7i.8xlarge`:
+
+```
+CPU CORE SOCKET
+  0    0      0
+  1    1      0
+  ...
+ 15   15      0
+ 16    0      0   <-- SMT sibling of CPU 0
+ 17    1      0   <-- SMT sibling of CPU 1
+  ...
+```
+
+If the layout is interleaved instead (CPU 0 / CPU 1 both on CORE 0), the
+pinning expression needs to step by 2, e.g. `taskset -c 0,2,4,6` for slot 1.
+
+### 1. Emit a focused timing job list
+
+Limit the timing sweep to cells you actually want to cite. Small-n cells
+(n ≤ 100) are dominated by Python / TensorFlow startup and are not
+informative for a scaling story; drop them.
+
+```bash
+.venv/bin/python -m experiments.run \
+  --functions borehole \
+  --methods MOOGP MOGP LCGP OILMM PUQ \
+  --ns 250 1000 2500 \
+  --ps 5 10 20 \
+  --reps 5 \
+  --base-seed 123 \
+  --results-dir results_timing \
+  --emit-jobs results_timing/jobs.txt
+
+wc -l results_timing/jobs.txt   # expect 5 methods × 3 ns × 3 ps × 5 reps = 225
+```
+
+Use **the same `--base-seed`** as the accuracy sweep so that
+`(base_seed, function, n, p, rep)` resolves to identical method seeds — the
+fit produced by the timing run is bit-identical to the corresponding row in
+the accuracy sweep. This is the link that lets you cite both numbers as
+coming from "the same experimental configuration."
+
+### 2. Capture provenance
+
+Reviewers will ask exactly which hardware and which package versions
+produced the numbers. Capture once, at launch:
+
+```bash
+mkdir -p results_timing/provenance
+{
+  echo "=== instance ==="
+  curl -s http://169.254.169.254/latest/meta-data/instance-type; echo
+  echo "=== nproc ===";  nproc
+  echo "=== lscpu ==="
+  lscpu
+  echo "=== topology ==="
+  lscpu --extended=CPU,CORE,SOCKET
+  echo "=== mem ===";    free -h
+  echo "=== kernel ===";  uname -a
+  echo "=== blas (.venv) ==="
+  .venv/bin/python -c "import numpy; numpy.show_config()" || true
+  .venv/bin/python -m experiments.thread_diagnostics || true
+} > results_timing/provenance/env.txt 2>&1
+
+git rev-parse HEAD        > results_timing/provenance/git_sha.txt
+git status --porcelain    > results_timing/provenance/git_status.txt
+.venv/bin/pip freeze       > results_timing/provenance/pip_freeze.venv.txt
+.venv-oilmm/bin/pip freeze > results_timing/provenance/pip_freeze.venv-oilmm.txt
+.venv-puq/bin/pip freeze   > results_timing/provenance/pip_freeze.venv-puq.txt
+```
+
+### 3. Launch the pinned sweep inside tmux
+
+```bash
+tmux new -s moogp-timing
+```
+
+Inside the tmux session, from the repo root:
+
+```bash
+JOBS=4
+THREADS=4
+MOOGP_CONFIG="$PWD/results_timing/config.json" \
+MOOGP_OUTPUT_DIR="$PWD/results_timing/jobs" \
+MOOGP_SKIP_EXISTING=1 \
+MOOGP_THREADS="$THREADS" \
+parallel -j "$JOBS" --colsep ' ' --joblog results_timing/jobs.log \
+  'taskset -c $((({%}-1)*4))-$(( ({%}-1)*4 + 3 )) ./experiments/run_one.sh {1} {2} {3} {4} {5} {6}' \
+  :::: results_timing/jobs.txt
+```
+
+What the `taskset` expression does, slot by slot:
+
+| GNU parallel slot (`{%}`) | `taskset -c` range | Physical cores |
+| --- | --- | --- |
+| 1 | `0-3`   | 0, 1, 2, 3 |
+| 2 | `4-7`   | 4, 5, 6, 7 |
+| 3 | `8-11`  | 8, 9, 10, 11 |
+| 4 | `12-15` | 12, 13, 14, 15 |
+
+The kernel cannot migrate a job's threads off its assigned cores, and no two
+jobs share a physical core. With `OMP_NUM_THREADS=4` (set by `run_one.sh`
+from `MOOGP_THREADS=4`), each BLAS thread lands on its own dedicated core.
+
+Detach with `Ctrl-b d`. Re-attach with `tmux a -t moogp-timing`.
+
+### 4. Continuous sanity monitoring
+
+In a separate tmux pane (`Ctrl-b "` to split horizontally):
+
+```bash
+watch -n 30 '
+  echo "=== last 3 completed jobs ===";
+  tail -3 results_timing/jobs.log;
+  echo;
+  echo "=== memory ===";
+  free -h;
+  echo;
+  echo "=== active workers ===";
+  pgrep -af method_runner;
+  echo;
+  echo "=== per-worker CPU affinity ===";
+  for pid in $(pgrep method_runner); do
+    echo "PID $pid: $(taskset -pc $pid 2>/dev/null | sed s/.*list:.//)";
+  done;
+  echo;
+  echo "=== files written ===";
+  ls results_timing/jobs 2>/dev/null | wc -l
+'
+```
+
+What to watch for:
+
+- **`pgrep -af method_runner` returns at most 4 lines.** If it ever returns
+  5+, GNU parallel has launched more jobs than `JOBS=4` — investigate.
+- **Each worker's affinity list is exactly 4 CPUs from a single slot's range
+  (0–3, 4–7, 8–11, or 12–15).** If a worker shows the full `0-31` range,
+  the `taskset` wrapper failed and the run is invalid.
+- **No `Signal=9` rows in `jobs.log`** — that would indicate an OOM kill
+  (extremely unlikely with `JOBS=4` on 64 GiB).
+- **Memory `available` stays above ~20 GiB.** With 4 concurrent fits each
+  using ~6–8 GiB RSS, this should be comfortable.
+
+### 5. Merge and stash
+
+```bash
+.venv/bin/python -m experiments.merge_results \
+  --input-dir results_timing/jobs \
+  --output    results_timing/timing_results.csv
+
+aws s3 cp results_timing/timing_results.csv \
+  s3://<your-bucket>/<run-prefix>/timing_results.csv
+aws s3 sync results_timing/provenance/ \
+  s3://<your-bucket>/<run-prefix>/timing_provenance/
+```
+
+Keep the output filename distinct from the accuracy sweep's `results.csv` so
+the two are never accidentally co-plotted.
+
+### 6. Quality checks before publishing the numbers
+
+```bash
+# Any non-zero exits or signals?
+awk 'NR>1 && ($7 != 0 || $8 != 0)' results_timing/jobs.log
+
+# Did every requested cell complete?
+wc -l results_timing/jobs.txt
+ls results_timing/jobs | wc -l
+
+# Within-cell coefficient of variation. Should be < ~10%.
+.venv/bin/python - <<'PY'
+import pandas as pd
+df = pd.read_csv("results_timing/timing_results.csv")
+g = df.groupby(["method","n","p"])["fit_time_seconds"]
+out = g.agg(["mean","std","count"]).assign(cv=lambda x: x["std"]/x["mean"])
+print(out.sort_values("cv", ascending=False).head(20))
+PY
+```
+
+If any (method, n, p) cell has **CV > 15%**, do not report median timing for
+that cell as-is. Likely causes:
+
+- A background process landed on the box mid-sweep (check `dmesg`/`journalctl`
+  around the slow rep's timestamp).
+- The first rep is much slower than the others due to JIT / import warm-up —
+  trim the first rep and re-aggregate, or report median of reps 2–5.
+- The method has genuine optimizer-stochasticity-driven runtime variance.
+  In that case report it (e.g. with an IQR) rather than hide it.
+
+Cross-check against the accuracy sweep's *cleanest* runs (e.g. for LCGP
+n=2500 p=5 the fastest throughput-run rep was ~24k sec). The pinned timing
+sweep should produce numbers in the same ballpark — within ~10% of that
+floor. If it's substantially slower, the pinning may not be in effect;
+re-verify with `taskset -pc <pid>` on a live worker.
+
+### 7. Reporting language
+
+A short methodology paragraph that pre-empts every likely reviewer question:
+
+> Wall-clock timings are reported from a dedicated timing sweep on a single
+> AWS `c7i.8xlarge` instance (16 physical Intel Sapphire Rapids cores, 32
+> vCPUs with SMT, 64 GiB RAM, Ubuntu 24.04). Four fits ran concurrently,
+> each pinned via `taskset` to four dedicated physical cores
+> (`OMP_NUM_THREADS=OPENBLAS_NUM_THREADS=MKL_NUM_THREADS=`
+> `TF_NUM_INTRAOP_THREADS=4`); SMT siblings were left idle so no fit shared
+> a physical core with another. We report median over 5 replications per
+> (method, n, p). Accuracy metrics (RMSE, coverage, DSS) are taken from a
+> separate larger parallel sweep with deterministic seeds derived from
+> `(base_seed, function, n, p, rep)`; the per-fit code path is unchanged
+> between the two sweeps, so the timing-sweep fits are bit-identical to the
+> corresponding accuracy rows.
+
+That paragraph is true **only if** `--base-seed` matches between the two
+sweeps. Verify before submission.
+
+### When this setup is not appropriate
+
+- **Sub-percent timing claims.** If you need to defend "method X is 2.3%
+  faster than method Y," the L3 / memory-bandwidth contention between the
+  4 concurrent fits is no longer negligible. Drop to `JOBS=1` (one fit at a
+  time, 12 idle physical cores) or run separate `c7i.2xlarge` instances in
+  parallel with `JOBS=1` on each.
+- **Different per-method thread budgets.** If you want to claim "method X
+  given all 16 physical cores takes T seconds," you need a different setup
+  (`JOBS=1 THREADS=16` and verified per-method scaling). That's a different
+  experiment with a different claim.
+- **A different instance family for timing vs. accuracy.** Don't.
+  Re-running on identical hardware is one of the easiest ways to preserve
+  the methodological link.

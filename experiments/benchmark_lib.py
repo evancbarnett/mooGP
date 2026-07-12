@@ -66,9 +66,9 @@ DEFAULT_OILMM_PYTHON = REPO_ROOT / ".venv-oilmm" / "bin" / "python"
 DEFAULT_PUQ_PYTHON = REPO_ROOT / ".venv-puq" / "bin" / "python"
 
 # The VAH dataset ships at a fixed shape; the values here must match
-# moogp/nuclear_data/all_theta.csv and all_f.csv. They are validated against the
+# examples/nuclear_data/all_theta.csv and all_f.csv. They are validated against the
 # files at load time in `_load_vah_arrays`.
-VAH_DATA_DIR = REPO_ROOT / "moogp" / "nuclear_data"
+VAH_DATA_DIR = REPO_ROOT / "examples" / "nuclear_data"
 VAH_THETA_PATH = VAH_DATA_DIR / "all_theta.csv"
 VAH_F_PATH = VAH_DATA_DIR / "all_f.csv"
 VAH_INDEX_PATH = VAH_DATA_DIR / "all_f_index.csv"
