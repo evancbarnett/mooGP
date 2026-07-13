@@ -134,7 +134,10 @@ Default values:
  - Output dimension (`--ps`): `[10, 20, 50]`
  - Replications (`--reps`): `5`
  - Test size (`--n-test`): `250`
- - Latent dimension (`--q`): `5`
+ - Latent dimension: fixed `--q 5` by default, or select a per-cell rank with
+   `--var-threshold FLOAT` (mutually exclusive with `--q`). Threshold mode uses
+   the common column-wise z-scored noisy training response and records the
+   selected integer `q` in each result row.
  - Optimizer max iterations (`--maxiter`): `1000`
  - Jitter: `1e-6`
  - Per-output noise: `0.05 * Var(y)`

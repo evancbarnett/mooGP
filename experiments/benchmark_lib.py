@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -37,6 +37,7 @@ RESULT_COLUMNS = [
     "n_train",
     "p",
     "q",
+    "var_threshold",
     "rep",
     "seed_data",
     "seed_model",
@@ -96,7 +97,7 @@ class ExperimentConfig:
     output_dims: tuple[int, ...]
     reps: int
     n_test: int
-    q: int
+    q: int | None
     maxiter: int
     jitter: float
     noise_var_frac: float
@@ -104,11 +105,25 @@ class ExperimentConfig:
     jobs: int
     base_seed: int
     results_dir: Path
+    var_threshold: float | None = None
     moogp_python: Path = field(default=DEFAULT_MOOGP_PYTHON)
     oilmm_python: Path = field(default=DEFAULT_OILMM_PYTHON)
     puq_python: Path = field(default=DEFAULT_PUQ_PYTHON)
     n_folds: int = 5
     vah_grouping: str = "index"
+
+    def __post_init__(self) -> None:
+        """Validate the mutually exclusive latent-rank configuration."""
+
+        if (self.q is None) == (self.var_threshold is None):
+            raise ValueError("Provide exactly one of `q` or `var_threshold`.")
+        if self.q is not None and int(self.q) < 1:
+            raise ValueError(f"q must be a positive integer; got {self.q}.")
+        if self.var_threshold is not None and not (0.0 < float(self.var_threshold) < 1.0):
+            raise ValueError(
+                "var_threshold must lie in the open interval (0, 1); "
+                f"got {self.var_threshold}."
+            )
 
     def to_metadata(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -120,6 +135,11 @@ class ExperimentConfig:
 
     @classmethod
     def from_metadata(cls, payload: dict[str, Any]) -> "ExperimentConfig":
+        var_threshold_payload = payload.get("var_threshold")
+        q_payload = payload.get(
+            "q",
+            None if var_threshold_payload is not None else 5,
+        )
         return cls(
             functions=tuple(payload["functions"]),
             methods=tuple(payload["methods"]),
@@ -127,7 +147,7 @@ class ExperimentConfig:
             output_dims=tuple(payload["output_dims"]),
             reps=int(payload["reps"]),
             n_test=int(payload["n_test"]),
-            q=int(payload["q"]),
+            q=None if q_payload is None else int(q_payload),
             maxiter=int(payload["maxiter"]),
             jitter=float(payload["jitter"]),
             noise_var_frac=float(payload["noise_var_frac"]),
@@ -135,6 +155,11 @@ class ExperimentConfig:
             jobs=int(payload["jobs"]),
             base_seed=int(payload["base_seed"]),
             results_dir=Path(payload["results_dir"]),
+            var_threshold=(
+                None
+                if var_threshold_payload is None
+                else float(var_threshold_payload)
+            ),
             moogp_python=Path(payload.get("moogp_python", DEFAULT_MOOGP_PYTHON)),
             oilmm_python=Path(payload.get("oilmm_python", DEFAULT_OILMM_PYTHON)),
             puq_python=Path(payload.get("puq_python", DEFAULT_PUQ_PYTHON)),
@@ -244,6 +269,33 @@ def effective_latent_rank(q_requested: int, n: int, p: int) -> int:
     """Return the latent rank actually used for one benchmark cell."""
 
     return int(min(q_requested, p, n))
+
+
+def resolve_configured_latent_rank(
+    config: ExperimentConfig,
+    bundle: DatasetBundle,
+) -> int:
+    """Resolve the integer latent rank for one deterministic dataset cell.
+
+    Fixed-rank sweeps retain the historical ``min(q, n, p)`` behavior. In
+    variance-threshold mode, rank is selected from the common column-wise
+    z-scored noisy training response before method dispatch. Passing the same
+    resulting integer to every latent-factor adapter prevents method-specific
+    preprocessing defaults from silently choosing different ranks.
+    """
+
+    if config.q is not None:
+        return effective_latent_rank(config.q, n=bundle.n, p=bundle.p)
+
+    if config.var_threshold is None:  # pragma: no cover - guarded by config validation
+        raise ValueError("Either q or var_threshold must be configured.")
+
+    from moogp.model import compute_working_y, resolve_q_from_var_threshold
+
+    y_train = np.asarray(bundle.train_data["Y"], dtype=float)
+    y_work, _, _ = compute_working_y(y_train, "zscore")
+    q_selected = resolve_q_from_var_threshold(y_work, config.var_threshold)
+    return effective_latent_rank(q_selected, n=bundle.n, p=bundle.p)
 
 
 def timestamp_utc() -> str:
@@ -1153,7 +1205,8 @@ def make_base_row(
     method: str,
     n: int,
     p: int,
-    q: int,
+    q: int | None,
+    var_threshold: float | None,
     rep: int,
     seed_data: int,
     seed_model: int,
@@ -1168,6 +1221,7 @@ def make_base_row(
         "n": n,
         "p": p,
         "q": q,
+        "var_threshold": var_threshold,
         "rep": rep,
         "seed_data": seed_data,
         "seed_model": seed_model,
@@ -1203,7 +1257,8 @@ def run_single_method_local(
 
     seed_data = bundle.seed_data
     seed_model = stable_seed(config.base_seed, function, method, n, p, rep, "model")
-    q_eff = effective_latent_rank(config.q, n=n, p=p)
+    q_eff = resolve_configured_latent_rank(config, bundle)
+    fit_config = replace(config, q=q_eff, var_threshold=None)
     n_folds_row = config.n_folds if function == "vah_nuclear" else None
     row = make_base_row(
         run_id=run_id,
@@ -1212,6 +1267,7 @@ def run_single_method_local(
         n=n,
         p=p,
         q=q_eff,
+        var_threshold=config.var_threshold,
         rep=rep,
         seed_data=seed_data,
         seed_model=seed_model,
@@ -1222,7 +1278,12 @@ def run_single_method_local(
     row["n_train"] = int(bundle.n)
 
     try:
-        predictor = fit_method_local(method=method, bundle=bundle, seed_model=seed_model, config=config)
+        predictor = fit_method_local(
+            method=method,
+            bundle=bundle,
+            seed_model=seed_model,
+            config=fit_config,
+        )
         row["train_time_sec"] = predictor.train_time_sec
         row["status"] = predictor.status
         row["error"] = predictor.error
@@ -1270,7 +1331,7 @@ def run_single_method_subprocess(
     """Run one method in its dedicated virtualenv and return the result row."""
 
     seed_model = stable_seed(config.base_seed, function, method, n, p, rep, "model")
-    q_eff = effective_latent_rank(config.q, n=n, p=p)
+    q_eff = None if config.q is None else effective_latent_rank(config.q, n=n, p=p)
     n_folds_row = config.n_folds if function == "vah_nuclear" else None
     row = make_base_row(
         run_id=run_id,
@@ -1279,6 +1340,7 @@ def run_single_method_subprocess(
         n=n,
         p=p,
         q=q_eff,
+        var_threshold=config.var_threshold,
         rep=rep,
         seed_data=seed_data,
         seed_model=seed_model,

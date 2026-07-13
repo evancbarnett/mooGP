@@ -93,11 +93,25 @@ def build_parser() -> argparse.ArgumentParser:
             "per output. Ignored by OILMM and PUQ."
         ),
     )
-    parser.add_argument(
+    rank_group = parser.add_mutually_exclusive_group()
+    rank_group.add_argument(
         "--q",
         type=int,
-        default=5,
-        help="Maximum latent rank used for MOOGP and MOGP.",
+        default=None,
+        help=(
+            "Fixed latent rank used by MOOGP, MOGP, LCGP, and OILMM. "
+            "Defaults to 5 when neither rank option is supplied."
+        ),
+    )
+    rank_group.add_argument(
+        "--var-threshold",
+        type=float,
+        default=None,
+        help=(
+            "Select the smallest per-cell latent rank whose cumulative SVD "
+            "variance on the common z-scored training outputs strictly exceeds "
+            "this fraction. Mutually exclusive with --q."
+        ),
     )
     parser.add_argument(
         "--maxiter",
@@ -186,6 +200,7 @@ def main() -> int:
     """Parse CLI arguments, run the benchmark, and print a short summary."""
 
     args = build_parser().parse_args()
+    q = 5 if args.q is None and args.var_threshold is None else args.q
     config = ExperimentConfig(
         functions=tuple(args.functions),
         methods=tuple(args.methods),
@@ -193,7 +208,7 @@ def main() -> int:
         output_dims=tuple(args.ps),
         reps=args.reps,
         n_test=args.n_test,
-        q=args.q,
+        q=q,
         maxiter=args.maxiter,
         jitter=args.jitter,
         noise_var_frac=args.noise_var_frac,
@@ -201,6 +216,7 @@ def main() -> int:
         jobs=args.jobs,
         base_seed=args.base_seed,
         results_dir=args.results_dir,
+        var_threshold=args.var_threshold,
         moogp_python=args.moogp_python,
         oilmm_python=args.oilmm_python,
         puq_python=args.puq_python,

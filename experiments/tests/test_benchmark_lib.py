@@ -10,6 +10,7 @@ import pytest
 
 from .. import benchmark_lib
 from ..benchmark_lib import (
+    DatasetBundle,
     ExperimentConfig,
     FittedPredictor,
     PredictionBundle,
@@ -119,6 +120,119 @@ def test_experiment_config_round_trips_python_paths(tmp_path: Path):
 
     assert restored.moogp_python == Path("/tmp/moogp-python")
     assert restored.oilmm_python == Path("/tmp/oilmm-python")
+
+
+def test_experiment_config_round_trips_var_threshold(tmp_path: Path):
+    config = ExperimentConfig(
+        functions=("borehole",),
+        methods=("MOOGP", "LCGP"),
+        sample_sizes=(8,),
+        output_dims=(3,),
+        reps=1,
+        n_test=5,
+        q=None,
+        var_threshold=0.8,
+        maxiter=5,
+        jitter=1e-6,
+        noise_var_frac=1e-2,
+        use_fast=True,
+        jobs=1,
+        base_seed=123,
+        results_dir=tmp_path,
+    )
+
+    restored = ExperimentConfig.from_metadata(config.to_metadata())
+
+    assert restored == config
+    assert restored.q is None
+    assert restored.var_threshold == pytest.approx(0.8)
+
+
+def test_var_threshold_selects_rank_and_passes_it_to_method_adapter(
+    tmp_path: Path,
+    monkeypatch,
+):
+    config = ExperimentConfig(
+        functions=("borehole",),
+        methods=("LCGP",),
+        sample_sizes=(4,),
+        output_dims=(3,),
+        reps=1,
+        n_test=2,
+        q=None,
+        var_threshold=0.8,
+        maxiter=5,
+        jitter=1e-6,
+        noise_var_frac=1e-2,
+        use_fast=True,
+        jobs=1,
+        base_seed=123,
+        results_dir=tmp_path,
+    )
+    first_component = np.array([-1.0, -1.0, 1.0, 1.0])
+    second_component = np.array([-1.0, 1.0, -1.0, 1.0])
+    y_train = np.column_stack(
+        [first_component, first_component, second_component]
+    )
+    bundle = DatasetBundle(
+        function="borehole",
+        n=4,
+        p=3,
+        seed_data=456,
+        train_data={
+            "X_scaled": np.arange(4, dtype=float)[:, None],
+            "Y": y_train,
+            "y": y_train,
+        },
+        test_X_scaled=np.array([[0.25], [0.75]]),
+        test_Y_true=np.zeros((2, 3), dtype=float),
+    )
+    captured: dict[str, ExperimentConfig] = {}
+
+    def fake_fit_method_local(*, method, bundle, seed_model, config):
+        captured[method] = config
+        return FittedPredictor(
+            predict_fn=lambda Xstar: PredictionBundle(
+                mean=np.zeros((np.asarray(Xstar).shape[0], 3), dtype=float),
+                std=np.ones((np.asarray(Xstar).shape[0], 3), dtype=float),
+            ),
+            status="ok",
+            train_time_sec=0.1,
+        )
+
+    monkeypatch.setattr(benchmark_lib, "fit_method_local", fake_fit_method_local)
+    monkeypatch.setattr(benchmark_lib, "normalized_rmse", lambda *_args: 0.0)
+    monkeypatch.setattr(
+        benchmark_lib,
+        "compute_metrics",
+        lambda *_args, **_kwargs: {
+            "rmse": 0.0,
+            "normalized_rmse": 0.0,
+            "coverage_95": 1.0,
+            "interval_len_95": 1.0,
+            "dss_diag": 0.0,
+            "dss_full": None,
+        },
+    )
+
+    row = run_single_method_local(
+        run_id="run_threshold",
+        function="borehole",
+        method="LCGP",
+        n=4,
+        p=3,
+        rep=1,
+        bundle=bundle,
+        config=config,
+    )
+
+    # After column-wise z-scoring, the controlled response has squared
+    # singular values 8, 4, 0. The first component explains 2/3, so a 0.8
+    # threshold must select q=2 using the strict cumulative-variance rule.
+    assert row["q"] == 2
+    assert row["var_threshold"] == pytest.approx(0.8)
+    assert captured["LCGP"].q == 2
+    assert captured["LCGP"].var_threshold is None
 
 
 def test_method_python_executable_uses_method_specific_interpreters(tmp_path: Path):
