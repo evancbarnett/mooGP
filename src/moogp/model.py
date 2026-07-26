@@ -21,6 +21,11 @@ from .kernels import (
     IM_dlogell_gauss,
     ILL_dlogell_gauss,
 )
+from .preprocessing import (
+    _normalize_standardize_y_mode,
+    compute_working_y,
+    resolve_q_from_var_threshold,
+)
 from autograd import value_and_grad
 
 
@@ -325,79 +330,6 @@ def init_phi(Y, q, n):
     Phi = V[:, :q] * np.sqrt(n) / s_q[None, :]
     d = n / (s_q ** 2)
     return Phi, d
-
-
-def resolve_q_from_var_threshold(Y, var_threshold):
-    """Choose the number of latent GPs ``q`` from a target variance fraction.
-
-    Mirrors LCGP's selection rule: with the singular values
-    ``s_1 >= s_2 >= ...`` of ``Y``, pick the smallest ``q`` whose cumulative
-    spectral energy ``sum_{i<=q} s_i^2 / sum_i s_i^2`` strictly exceeds
-    ``var_threshold``.
-
-    Parameters
-    ----------
-    Y : (n, p) array
-        Outputs whose SVD determines the orthogonal basis. Singular values are
-        orientation-invariant, so this matches LCGP even though LCGP stores its
-        outputs transposed (``(p, n)``).
-    var_threshold : float
-        Target fraction of output variance to retain, in the open interval
-        ``(0, 1)``.
-
-    Returns
-    -------
-    int
-        The selected number of components ``q`` (``1 <= q <= min(n, p)``).
-    """
-    if not (0.0 < var_threshold < 1.0):
-        raise ValueError(f"var_threshold must lie in (0, 1); got {var_threshold}.")
-    Y = np.asarray(Y, float)
-    svals = np.linalg.svd(Y, compute_uv=False)
-    cumvar = np.cumsum(svals ** 2) / np.sum(svals ** 2)
-    return int(np.argmax(cumvar > var_threshold) + 1)
-
-
-def _normalize_standardize_y_mode(standardize_y):
-    """Normalize user-facing output-standardization options."""
-    if standardize_y in (False, None):
-        return False
-    if standardize_y is True:
-        return "zscore"
-    if isinstance(standardize_y, str):
-        mode = standardize_y.lower()
-        if mode in {"zscore", "robust"}:
-            return mode
-    raise ValueError("standardize_y must be one of False, True, 'zscore', or 'robust'.")
-
-
-def _compute_y_center_scale(Y, mode):
-    """Return per-output center and spread for the working response scale."""
-    Y = np.asarray(Y, float)
-    p = Y.shape[1]
-
-    if mode is False:
-        return np.zeros(p, dtype=float), np.ones(p, dtype=float)
-
-    if mode == "zscore":
-        center = np.mean(Y, axis=0)
-        scale = np.std(Y, axis=0, ddof=1)
-    elif mode == "robust":
-        center = np.median(Y, axis=0)
-        scale = np.median(np.abs(Y - center[None, :]), axis=0)
-    else:  # pragma: no cover - guarded by _normalize_standardize_y_mode
-        raise ValueError(f"Unsupported standardize_y mode: {mode}")
-
-    scale = np.where(scale > 1e-12, scale, 1.0)
-    return np.asarray(center, float), np.asarray(scale, float)
-
-
-def compute_working_y(Y, standardize_y):
-    """Project raw outputs onto the model's internal working scale."""
-    mode = _normalize_standardize_y_mode(standardize_y)
-    center, scale = _compute_y_center_scale(Y, mode)
-    Y_work = (np.asarray(Y, float) - center[None, :]) / scale[None, :]
-    return Y_work, center, scale
 
 
 def _normalize_standardize_x_mode(standardize_x):

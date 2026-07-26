@@ -25,6 +25,7 @@ from moogp.datasets import (
     tstd2theta,
 )
 from moogp.evaluation import dss, intervalstats, normalized_rmse, rmse
+from moogp.preprocessing import compute_working_y, resolve_q_from_var_threshold
 
 
 OPTIMIZER_DIAGNOSTIC_COLUMNS = ("nit", "njev", "nfev")
@@ -299,8 +300,6 @@ def resolve_configured_latent_rank(
 
     if config.var_threshold is None:  # pragma: no cover - guarded by config validation
         raise ValueError("Either q or var_threshold must be configured.")
-
-    from moogp.model import compute_working_y, resolve_q_from_var_threshold
 
     y_train = np.asarray(bundle.train_data["Y"], dtype=float)
     y_work, _, _ = compute_working_y(y_train, "zscore")

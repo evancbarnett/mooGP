@@ -285,6 +285,80 @@ def test_var_threshold_selects_rank_and_passes_it_to_method_adapter(
     assert captured["LCGP"].var_threshold is None
 
 
+def test_var_threshold_rank_resolution_does_not_import_moogp_model(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """Lean OILMM/PUQ workers must not need the model's autograd dependency."""
+    config = ExperimentConfig(
+        functions=("borehole",),
+        methods=("OILMM",),
+        sample_sizes=(4,),
+        output_dims=(3,),
+        reps=1,
+        n_test=2,
+        q=None,
+        var_threshold=0.8,
+        maxiter=5,
+        jitter=1e-6,
+        noise_var_frac=1e-2,
+        use_fast=True,
+        jobs=1,
+        base_seed=123,
+        results_dir=tmp_path,
+    )
+    first_component = np.array([-1.0, -1.0, 1.0, 1.0])
+    second_component = np.array([-1.0, 1.0, -1.0, 1.0])
+    y_train = np.column_stack(
+        [first_component, first_component, second_component]
+    )
+    bundle = DatasetBundle(
+        function="borehole",
+        n=4,
+        p=3,
+        seed_data=456,
+        train_data={"Y": y_train},
+        test_X_scaled=np.empty((0, 1)),
+        test_Y_true=np.empty((0, 3)),
+    )
+    real_import = __import__
+
+    def reject_model_import(name, *args, **kwargs):
+        if name == "moogp.model":
+            raise AssertionError("rank resolution imported moogp.model")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", reject_model_import)
+
+    assert benchmark_lib.resolve_configured_latent_rank(config, bundle) == 2
+
+
+def test_benchmark_worker_import_does_not_require_autograd():
+    """A fresh lean worker can import the harness when autograd is unavailable."""
+    script = """
+import builtins
+
+real_import = builtins.__import__
+
+def reject_autograd(name, *args, **kwargs):
+    if name == "autograd" or name.startswith("autograd."):
+        raise ModuleNotFoundError("blocked autograd for lean-worker regression test")
+    return real_import(name, *args, **kwargs)
+
+builtins.__import__ = reject_autograd
+from experiments.benchmark_lib import resolve_configured_latent_rank
+assert callable(resolve_configured_latent_rank)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
 def test_method_python_executable_uses_method_specific_interpreters(tmp_path: Path):
     config = ExperimentConfig(
         functions=("borehole",),
