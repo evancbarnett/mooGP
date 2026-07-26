@@ -106,6 +106,7 @@ class ExperimentConfig:
     base_seed: int
     results_dir: Path
     var_threshold: float | None = None
+    latent_ell_upper: float = 20.0
     moogp_python: Path = field(default=DEFAULT_MOOGP_PYTHON)
     oilmm_python: Path = field(default=DEFAULT_OILMM_PYTHON)
     puq_python: Path = field(default=DEFAULT_PUQ_PYTHON)
@@ -123,6 +124,11 @@ class ExperimentConfig:
             raise ValueError(
                 "var_threshold must lie in the open interval (0, 1); "
                 f"got {self.var_threshold}."
+            )
+        if not np.isfinite(self.latent_ell_upper) or self.latent_ell_upper <= 0.05:
+            raise ValueError(
+                "latent_ell_upper must be finite and greater than the model's "
+                f"0.05 lower bound; got {self.latent_ell_upper}."
             )
 
     def to_metadata(self) -> dict[str, Any]:
@@ -160,6 +166,10 @@ class ExperimentConfig:
                 if var_threshold_payload is None
                 else float(var_threshold_payload)
             ),
+            # Metadata written before this field existed used the model's
+            # historical upper bound of 100. Preserve that meaning when old
+            # job configs are replayed; newly emitted configs record 20.
+            latent_ell_upper=float(payload.get("latent_ell_upper", 100.0)),
             moogp_python=Path(payload.get("moogp_python", DEFAULT_MOOGP_PYTHON)),
             oilmm_python=Path(payload.get("oilmm_python", DEFAULT_OILMM_PYTHON)),
             puq_python=Path(payload.get("puq_python", DEFAULT_PUQ_PYTHON)),
@@ -726,6 +736,7 @@ def _fit_moogp_like(
         standardize_x=standardize_x,
         x_margin=x_margin,
         diag_error_structure=diag_error_structure,
+        latent_ell_bounds=(MOOGP.DEFAULT_LATENT_ELL_BOUNDS[0], config.latent_ell_upper),
     )
     # theta0 / bounds are omitted: MOOGP.fit builds a data-aware initialization
     # internally from the standardized working-scale data (the SVD/input-spread

@@ -47,6 +47,7 @@ from moogp.kernels import (
 )
 from moogp.model import (
     MOOGP,
+    _fast_latent_cholesky,
     _latent_kernel_logtheta_grad,
     _predict_variance_diag_fast,
     _profiled_gls_terms,
@@ -117,6 +118,45 @@ def _bounds_for(q, d, p):
         lat.extend([(float(np.log(0.05)), float(np.log(5.0)))] * d)
     sigma = [(float(np.log(1e-6)), float(np.log(1.0)))] * p
     return lat + sigma
+
+
+def test_fast_latent_cholesky_symmetrizes_roundoff():
+    matrix = np.array([[2.0, 0.6], [0.4, 1.0]])
+    expected = 0.5 * (matrix + matrix.T)
+
+    chol = _fast_latent_cholesky(
+        matrix,
+        latent_index=0,
+        latent_count=1,
+        sigma2=3.0,
+        ell=np.array([2.0]),
+        woodbury_scale=4.0,
+    )
+
+    np.testing.assert_allclose(chol @ chol.T, expected)
+
+
+def test_fast_latent_cholesky_failure_reports_optimizer_state():
+    matrix = np.array([[1.0, 2.0], [2.0, 1.0]])
+
+    with pytest.raises(np.linalg.LinAlgError) as caught:
+        _fast_latent_cholesky(
+            matrix,
+            latent_index=1,
+            latent_count=3,
+            sigma2=325226.0,
+            ell=np.array([20.0, 2.25]),
+            woodbury_scale=20.5,
+        )
+
+    message = str(caught.value)
+    assert "latent=2/3" in message
+    assert "n=2" in message
+    assert "sigma2=325226" in message
+    assert "ell=[20." in message
+    assert "woodbury_scale=20.5" in message
+    assert "min_eigenvalue=-1" in message
+    assert "asymmetry_max=0" in message
 
 
 def _ref_se_kernel(X, Xp, ell, sigma2=1.0):

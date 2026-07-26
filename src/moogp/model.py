@@ -1,8 +1,9 @@
 import autograd.numpy as np
 import numpy as onp  # real numpy for non-traced theta0/bounds construction
 
+from autograd.tracer import getval
 from autograd.scipy.linalg import solve_triangular as ag_solve_triangular
-from scipy.linalg import cho_factor, cho_solve, solve, solve_triangular
+from scipy.linalg import cho_factor, cho_solve, eigh, solve, solve_triangular
 from scipy.linalg.lapack import dpotri
 from scipy.optimize import minimize
 
@@ -21,6 +22,75 @@ from .kernels import (
     ILL_dlogell_gauss,
 )
 from autograd import value_and_grad
+
+
+def _fast_latent_cholesky(
+    matrix,
+    *,
+    latent_index,
+    latent_count,
+    sigma2,
+    ell,
+    woodbury_scale,
+):
+    """Symmetrize and factor one fast-path latent matrix.
+
+    The orthogonalized covariance is theoretically symmetric positive
+    semidefinite, but its closed form subtracts nearly equal matrices at very
+    long length scales. Symmetrization removes harmless skew roundoff without
+    changing the intended covariance. If the matrix is still indefinite, fail
+    without adding an unrecorded nugget and attach enough information to the
+    exception for an experiment row to diagnose the offending optimizer state.
+    """
+
+    matrix_sym = 0.5 * (matrix + np.swapaxes(matrix, -1, -2))
+    try:
+        return np.linalg.cholesky(matrix_sym)
+    except onp.linalg.LinAlgError as exc:
+        matrix_value = onp.asarray(getval(matrix), dtype=float)
+        matrix_sym_value = 0.5 * (matrix_value + matrix_value.T)
+        sigma2_value = float(onp.asarray(getval(sigma2)))
+        ell_value = onp.asarray(getval(ell), dtype=float)
+        scale_value = float(onp.asarray(getval(woodbury_scale)))
+
+        finite = bool(onp.all(onp.isfinite(matrix_sym_value)))
+        min_eigenvalue = None
+        eigenvalue_error = None
+        if finite:
+            try:
+                min_eigenvalue = float(
+                    eigh(
+                        matrix_sym_value,
+                        eigvals_only=True,
+                        subset_by_index=[0, 0],
+                        check_finite=False,
+                    )[0]
+                )
+            except Exception as eig_exc:  # diagnostics must not mask the Cholesky failure
+                eigenvalue_error = f"{type(eig_exc).__name__}: {eig_exc}"
+
+        asymmetry_max = float(onp.max(onp.abs(matrix_value - matrix_value.T)))
+        min_diagonal = float(onp.min(onp.diag(matrix_sym_value)))
+        max_abs_entry = float(onp.max(onp.abs(matrix_sym_value)))
+        ell_text = onp.array2string(
+            ell_value,
+            precision=8,
+            separator=",",
+            max_line_width=10_000,
+        )
+        eig_text = (
+            f"{min_eigenvalue:.12g}"
+            if min_eigenvalue is not None
+            else f"unavailable ({eigenvalue_error or 'matrix contains non-finite values'})"
+        )
+        raise onp.linalg.LinAlgError(
+            "Fast-path latent Cholesky failed after symmetrization: "
+            f"latent={latent_index + 1}/{latent_count}, n={matrix_value.shape[0]}, "
+            f"sigma2={sigma2_value:.12g}, ell={ell_text}, "
+            f"woodbury_scale={scale_value:.12g}, finite={finite}, "
+            f"min_eigenvalue={eig_text}, min_diagonal={min_diagonal:.12g}, "
+            f"max_abs_entry={max_abs_entry:.12g}, asymmetry_max={asymmetry_max:.12g}."
+        ) from exc
 
 def normalize_diag_error_structure(diag_error_structure, p):
     """Validate and normalize a diagonal error grouping spec.
@@ -751,6 +821,7 @@ class MOOGP:
                  standardize_y="zscore",
                  standardize_x="unitcube",
                  x_margin=0.1,
+                 latent_ell_bounds=None,
                  use_analytical_grad=True):
         """
         Parameters
@@ -836,6 +907,12 @@ class MOOGP:
             on the VAH fold-1 margin sweep (see
             ``notebooks/vah_moogp_diagnostic.ipynb``). Ignored when
             ``standardize_x`` is disabled.
+        latent_ell_bounds : tuple[float, float] or None
+            Box bounds for every latent kernel length scale. ``None`` retains
+            the library default ``(0.05, 100.0)``. Benchmark harnesses can pass
+            a narrower, recorded box when very long length scales are
+            numerically indistinguishable from a constant process on the
+            standardized input domain.
         """
         self.terms = terms
         
@@ -870,6 +947,20 @@ class MOOGP:
         self.x_margin = float(x_margin)
         if self.x_margin < 0.0:
             raise ValueError(f"x_margin must be non-negative; got {self.x_margin}.")
+        if latent_ell_bounds is None:
+            latent_ell_bounds = self.DEFAULT_LATENT_ELL_BOUNDS
+        if len(latent_ell_bounds) != 2:
+            raise ValueError(
+                "latent_ell_bounds must contain exactly (lower, upper); "
+                f"got {latent_ell_bounds}."
+            )
+        ell_lb, ell_ub = (float(bound) for bound in latent_ell_bounds)
+        if not onp.isfinite(ell_lb) or not onp.isfinite(ell_ub) or not (0.0 < ell_lb < ell_ub):
+            raise ValueError(
+                "latent_ell_bounds must be finite and satisfy 0 < lower < upper; "
+                f"got {latent_ell_bounds}."
+            )
+        self.latent_ell_bounds = (ell_lb, ell_ub)
 
         self._data = None
         self.cache = None
@@ -1129,8 +1220,16 @@ class MOOGP:
                 Ck_star = Cj_list[k]
                 Dk = d_vals[k]
 
-                A = np.eye(n) + Dk * Ck_star 
-                L = np.linalg.cholesky(A)
+                A = np.eye(n) + Dk * Ck_star
+                sigma2_j, ell_j = lat_params[k]
+                L = _fast_latent_cholesky(
+                    A,
+                    latent_index=k,
+                    latent_count=self.q,
+                    sigma2=sigma2_j,
+                    ell=ell_j,
+                    woodbury_scale=Dk,
+                )
                 # log(det(A)) = 2 * sum(log(diag(L)))
                 logdetK += 2.0 * np.sum(np.log(np.diag(L)))
 
@@ -1308,7 +1407,15 @@ class MOOGP:
         logdetK = float(n) * float(np.sum(np.log(sigma_eps2)))
         for k in range(q):
             Ak = np.eye(n) + d_vals[k] * Cj_list[k]
-            Lk = np.linalg.cholesky(Ak)
+            sigma2_j, ell_j = lat_params[k]
+            Lk = _fast_latent_cholesky(
+                Ak,
+                latent_index=k,
+                latent_count=q,
+                sigma2=sigma2_j,
+                ell=ell_j,
+                woodbury_scale=d_vals[k],
+            )
             L_list.append(Lk)
             logdetK += 2.0 * float(np.sum(np.log(np.diag(Lk))))
 
@@ -1492,7 +1599,7 @@ class MOOGP:
 
         # 1. Latent kernel block: data-aware seeds + constant box.
         sig2_lb, sig2_ub = self.DEFAULT_LATENT_SIGMA2_BOUNDS
-        ell_lb, ell_ub = self.DEFAULT_LATENT_ELL_BOUNDS
+        ell_lb, ell_ub = self.latent_ell_bounds
         latent_box = [(float(onp.log(sig2_lb)), float(onp.log(sig2_ub)))] + (
             [(float(onp.log(ell_lb)), float(onp.log(ell_ub)))] * d
         )

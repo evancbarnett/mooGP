@@ -1,6 +1,3 @@
-import pytest
-
-
 def test(level=0):
     """
     Run full set of surmise tests.
@@ -19,6 +16,13 @@ def test(level=0):
 
     if level not in VERBOSITY:
         raise ValueError(f"level must be in {VERBOSITY}")
+
+    try:
+        import pytest
+    except ImportError as exc:
+        raise ImportError(
+            "moogp.test() requires pytest; install the project's test dependencies first."
+        ) from exc
 
     cmd = [f"--verbosity={level}", "--pyargs", "moogp.tests"]
 

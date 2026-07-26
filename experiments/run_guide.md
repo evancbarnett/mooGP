@@ -140,6 +140,10 @@ Default values:
    selected integer `q` in each result row.
  - Optimizer max iterations (`--maxiter`): `1000`
  - Jitter: `1e-6`
+ - MOOGP/MOGP latent length-scale upper bound (`--latent-ell-upper`): `20`
+   after the model maps inputs to its padded `[-1, 1]` working domain. The
+   value is recorded in `config.json`; metadata created before this option
+   existed retains the historical bound of `100` when replayed.
  - Per-output noise: `0.05 * Var(y)`
 
 In-process mode writes:
@@ -342,6 +346,54 @@ For an AWS Batch array job, set the array size to the number of lines in
 The required env vars (`MOOGP_CONFIG`, `MOOGP_OUTPUT_DIR`) belong in the job
 definition. Point `MOOGP_OUTPUT_DIR` at an EFS mount or a per-job S3-synced
 directory so the merge step can collect every row at the end.
+
+### Validate the MOOGP Cholesky repair before a full sweep
+
+Before launching the Borehole repair sweep, rerun the four cells that previously
+raised `LinAlgError`. This keeps the production settings (`maxls=20`, four pinned
+cores, `base_seed=6767`, and `var_threshold=0.99`) while recording the new
+length-scale bound in a fresh config:
+
+```bash
+cd ~/moogp-experiments
+
+VALIDATE="$PWD/results/borehole-moogp-ell20-validation"
+.venv/bin/python -m experiments.run \
+  --functions borehole \
+  --methods MOOGP \
+  --ns 1000 2500 \
+  --ps 5 \
+  --reps 5 \
+  --n-test 800 \
+  --var-threshold 0.99 \
+  --maxiter 1000 \
+  --latent-ell-upper 20 \
+  --base-seed 6767 \
+  --results-dir "$VALIDATE" \
+  --emit-jobs "$VALIDATE/jobs.txt"
+
+RUN_ID="$(awk 'NR == 1 {print $1}' "$VALIDATE/jobs.txt")"
+mkdir -p "$VALIDATE/jobs"
+export MOOGP_CONFIG="$VALIDATE/config.json"
+export MOOGP_OUTPUT_DIR="$VALIDATE/jobs"
+export MOOGP_THREADS=4
+
+taskset -c 0-3 ./experiments/run_one.sh "$RUN_ID" borehole MOOGP 1000 5 1
+taskset -c 0-3 ./experiments/run_one.sh "$RUN_ID" borehole MOOGP 2500 5 2
+taskset -c 0-3 ./experiments/run_one.sh "$RUN_ID" borehole MOOGP 2500 5 3
+taskset -c 0-3 ./experiments/run_one.sh "$RUN_ID" borehole MOOGP 2500 5 5
+
+.venv/bin/python -m experiments.merge_results \
+  --input-dir "$VALIDATE/jobs" \
+  --output "$VALIDATE/results.csv"
+```
+
+All four rows must complete without `status=error`. An `ABNORMAL` line-search
+warning remains a separate optimizer-classification decision; this validation
+is specifically for the non-positive-definite Cholesky failure. If Cholesky
+still fails, the row's error now records the latent index, `sigma2`, length
+scales, Woodbury multiplier, matrix asymmetry, and smallest eigenvalue. Do not
+silently increase jitter based on that diagnostic.
 
 ### 3. Merge per-job CSVs into one results.csv
 

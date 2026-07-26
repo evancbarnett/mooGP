@@ -126,6 +126,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Jitter passed to MOOGP and MOGP.",
     )
     parser.add_argument(
+        "--latent-ell-upper",
+        type=float,
+        default=20.0,
+        help=(
+            "Upper box bound for MOOGP/MOGP latent length scales after input "
+            "standardization. Recorded in config metadata; default: 20."
+        ),
+    )
+    parser.add_argument(
         "--noise-var-frac",
         type=float,
         default=0.05,
@@ -217,6 +226,7 @@ def main() -> int:
         base_seed=args.base_seed,
         results_dir=args.results_dir,
         var_threshold=args.var_threshold,
+        latent_ell_upper=args.latent_ell_upper,
         moogp_python=args.moogp_python,
         oilmm_python=args.oilmm_python,
         puq_python=args.puq_python,

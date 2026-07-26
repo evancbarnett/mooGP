@@ -98,6 +98,29 @@ def test_default_theta0_and_bounds_packing_and_feasibility(learn_Psi, learn_sigm
         assert np.asarray(sigma_eps2).size == p  # broadcast back to per-output
 
 
+def test_custom_latent_ell_bounds_are_used_for_every_latent_dimension():
+    data = _forrester(n=30, seed=2)
+    model = _model(q=2, latent_ell_bounds=(0.05, 20.0))
+    model._prepare_data(data)
+
+    _, bounds = model._default_theta0_and_bounds()
+
+    # Each one-dimensional latent block is [log(sigma2), log(ell)].
+    ell_bounds = [bounds[1], bounds[3]]
+    expected = (np.log(0.05), np.log(20.0))
+    for actual in ell_bounds:
+        np.testing.assert_allclose(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "bounds",
+    [(0.0, 20.0), (20.0, 20.0), (20.0, 0.05), (0.05, np.inf), (0.05,)],
+)
+def test_invalid_latent_ell_bounds_are_rejected(bounds):
+    with pytest.raises(ValueError, match="latent_ell_bounds"):
+        _model(latent_ell_bounds=bounds)
+
+
 def test_default_sigma_eps_init_uses_standardized_y():
     """The noise init lives on the standardized scale, not the raw output scale."""
     data = _forrester(n=50, seed=5)

@@ -148,6 +148,56 @@ def test_experiment_config_round_trips_var_threshold(tmp_path: Path):
     assert restored.var_threshold == pytest.approx(0.8)
 
 
+def test_experiment_config_records_ell_upper_and_preserves_legacy_metadata(tmp_path: Path):
+    config = ExperimentConfig(
+        functions=("borehole",),
+        methods=("MOOGP",),
+        sample_sizes=(8,),
+        output_dims=(3,),
+        reps=1,
+        n_test=5,
+        q=2,
+        maxiter=5,
+        jitter=1e-6,
+        noise_var_frac=1e-2,
+        use_fast=True,
+        jobs=1,
+        base_seed=123,
+        results_dir=tmp_path,
+        latent_ell_upper=20.0,
+    )
+
+    payload = config.to_metadata()
+    assert payload["latent_ell_upper"] == pytest.approx(20.0)
+    assert ExperimentConfig.from_metadata(payload) == config
+
+    payload.pop("latent_ell_upper")
+    restored_legacy = ExperimentConfig.from_metadata(payload)
+    assert restored_legacy.latent_ell_upper == pytest.approx(100.0)
+
+
+@pytest.mark.parametrize("upper", [0.05, 0.0, np.inf, np.nan])
+def test_experiment_config_rejects_invalid_ell_upper(tmp_path: Path, upper: float):
+    with pytest.raises(ValueError, match="latent_ell_upper"):
+        ExperimentConfig(
+            functions=("borehole",),
+            methods=("MOOGP",),
+            sample_sizes=(8,),
+            output_dims=(3,),
+            reps=1,
+            n_test=5,
+            q=2,
+            maxiter=5,
+            jitter=1e-6,
+            noise_var_frac=1e-2,
+            use_fast=True,
+            jobs=1,
+            base_seed=123,
+            results_dir=tmp_path,
+            latent_ell_upper=upper,
+        )
+
+
 def test_var_threshold_selects_rank_and_passes_it_to_method_adapter(
     tmp_path: Path,
     monkeypatch,
@@ -722,6 +772,7 @@ def test_fit_method_local_moogp_delegates_data_aware_init_to_model(tmp_path: Pat
     assert fit_kwargs["bounds"] is None
     assert model.orthogonal is True
     assert model.standardize_y == "zscore"
+    assert model.latent_ell_bounds == pytest.approx((0.05, 20.0))
 
 
 def test_fit_method_local_mogp_delegates_data_aware_init_to_model(tmp_path: Path, monkeypatch):
@@ -733,6 +784,7 @@ def test_fit_method_local_mogp_delegates_data_aware_init_to_model(tmp_path: Path
     assert fit_kwargs["theta0"] is None
     assert fit_kwargs["bounds"] is None
     assert model.orthogonal is False
+    assert model.latent_ell_bounds == pytest.approx((0.05, 20.0))
     assert model.standardize_y == "zscore"
 
 
