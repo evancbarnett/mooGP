@@ -13,6 +13,22 @@ of `q` shared latent GPs, plus a regression trend `g(x)` that the latent
 kernels are orthogonalized against. Fitting the trend separately keeps its
 coefficients interpretable and improves extrapolation.
 
+## Citation
+
+If you use this work, please cite the [methodological paper](https://arxiv.org/abs/2608.00287):
+
+```bibtex
+@misc{barnett2026multioutput,
+      title={Multi-output Orthogonal Gaussian Processes for Noisy Simulator Outputs}, 
+      author={Evan C. Barnett and Moses Y.-H. Chan},
+      year={2026},
+      eprint={2608.00287},
+      archivePrefix={arXiv},
+      primaryClass={stat.ME},
+      url={https://arxiv.org/abs/2608.00287}, 
+}
+```
+
 ## Table of Contents
 
 - [Installation](#installation)
